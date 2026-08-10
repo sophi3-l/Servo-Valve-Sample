@@ -1,0 +1,15 @@
+# PlatformIO build output — never commit this (large, machine-specific)
+.pio/
+
+# VS Code — keep shared extension recommendations, ignore machine-local files
+.vscode/*
+!.vscode/extensions.json
+
+# Build artifacts
+*.bin
+*.elf
+*.hex
+
+# OS cruft
+Thumbs.db
+.DS_Store

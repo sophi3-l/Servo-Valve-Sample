@@ -1,0 +1,40 @@
+name: calibration-check
+
+# Runs on every push and pull request. The lint job is fast and needs no
+# toolchain; the build job compiles every PlatformIO environment so "it builds"
+# is confirmed automatically on each push.
+on:
+  push:
+  pull_request:
+
+jobs:
+  calibration-lint:
+    name: Validate calibration table
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check calibration.h
+        run: python tools/check_calibration.py include/calibration.h
+
+  build:
+    name: Build all PlatformIO environments
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Build
+        run: pio run -e calibrate -e deploy -e minideploy   # all envs (default_envs builds only deploy)
