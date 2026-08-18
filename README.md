@@ -146,6 +146,57 @@ the UI, and moves nothing. That is the safe bench configuration.
 
 ---
 
+## Working on more than one machine
+
+The repo is portable by design: **no tracked file references a specific machine.**
+The three that do — `.vscode/launch.json`, `.vscode/c_cpp_properties.json`, and
+`.pio/` — are gitignored and must stay that way. `launch.json` hardcodes the
+builder's home directory and toolchain path; `.pio/build/*/idedata.json` embeds
+absolute compiler paths. Committing either breaks the other machine.
+
+**Do not put a working clone inside OneDrive (or Dropbox).** Two sync mechanisms
+fighting over one working tree is the fastest way to a corrupted `.git` or a
+half-written build. `.pio/` alone is ~100 MB of churn per build, and gitignore
+does not stop OneDrive from syncing it. Clone to a plain local path:
+
+```
+git clone <repo-url> C:\dev\karen-valve
+cd C:\dev\karen-valve
+```
+
+Let GitHub be the sync mechanism, not the file-sync client.
+
+### Setting up a fresh machine
+
+```
+pip install -U platformio            # or install the PlatformIO IDE extension
+git clone <repo-url> C:\dev\karen-valve
+cd C:\dev\karen-valve
+pio run -e calibrate -e deploy -e minideploy      # downloads toolchain, builds all three
+python tools/check_calibration.py
+```
+
+That is the whole setup. PlatformIO fetches the platform, toolchain, and
+libraries into `~/.platformio` (outside the repo) on the first build, and
+`upload_port` is auto-detected so the COM number differing per laptop does not
+matter.
+
+### Pin the platform before flight
+
+`platformio.ini` currently tracks the pioarduino `stable` release, which is a
+**moving target** — two machines cloning on different days can get different
+ESP32 Arduino cores. Pin it once, from whichever machine has a known-good build:
+
+```
+pio pkg list -e deploy      # note the espressif32 version
+```
+
+then edit the `platform =` line in `platformio.ini` per the comment there, and
+commit. Unpinned is fine for bench iteration; it is not fine for the build that
+gets sealed into a lander.
+
+Library versions are already pinned exactly (`@3.0.3`, not `@^3.0.3`).
+
 ## Running a mini-deploy (lab)
 
 A rehearsal runs the **real** valve routine — 2 s settles, 116 s sample-open,

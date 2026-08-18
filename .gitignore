@@ -1,7 +1,10 @@
-# PlatformIO build output — never commit this (large, machine-specific)
+# PlatformIO build output — never commit this. Large (~100 MB), and it contains
+# absolute paths to whoever built it (see .pio/build/*/idedata.json).
 .pio/
 
-# VS Code — keep shared extension recommendations, ignore machine-local files
+# VS Code — keep shared extension recommendations, ignore machine-local files.
+# launch.json and c_cpp_properties.json both hardcode absolute paths to the
+# builder's home directory and toolchain, so they must never be committed.
 .vscode/*
 !.vscode/extensions.json
 
@@ -10,6 +13,16 @@
 *.elf
 *.hex
 
+# Serial monitor captures (pio device monitor -f log2file)
+platformio-device-monitor-*.log
+*.log
+
+# OneDrive / Dropbox conflict copies — these appear when the same folder is
+# synced to two machines and will confuse git if committed.
+*conflicted copy*
+*-conflicted-copy*
+
 # OS cruft
 Thumbs.db
 .DS_Store
+desktop.ini

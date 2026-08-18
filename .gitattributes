@@ -1,0 +1,20 @@
+# Line-ending normalization.
+#
+# Without this, a Windows checkout commits CRLF, the Linux CI runner sees every
+# line of every file as changed, and diffs between the two bench machines are
+# unreadable. `text=auto eol=lf` stores LF in the repo AND checks out LF, so
+# every machine and the CI runner agree byte-for-byte.
+#
+# After adding this file once, run:  git add --renormalize .
+* text=auto eol=lf
+
+# Firmware and binary artifacts must never be line-ending mangled.
+*.bin  binary
+*.elf  binary
+*.hex  binary
+*.a    binary
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.xlsx binary
+*.docx binary
