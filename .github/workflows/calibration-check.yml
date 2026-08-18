@@ -9,7 +9,7 @@ on:
 
 jobs:
   calibration-lint:
-    name: Validate calibration table
+    name: Validate calibration table + sample schedule
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.x"
       - name: Check calibration.h
-        run: python tools/check_calibration.py include/calibration.h
+        run: python tools/check_calibration.py include/calibration.h include/schedule.h
 
   build:
     name: Build all PlatformIO environments

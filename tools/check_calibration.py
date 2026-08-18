@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
 """
-check_calibration.py — validate the per-lander calibration table in calibration.h
+check_calibration.py — validate the shared headers that every build reads.
 
-Catches the mechanical mistakes a human editing CH_OPEN_DEG_ALL is most likely to
-make, so a mis-pasted or forgotten calibration can't reach a sealed unit:
+include/calibration.h and include/schedule.h carry static_asserts that catch the
+same mistakes at compile time. This script exists because the two gates fail at
+different moments: the asserts stop a bad build on the bench laptop, and this
+stops a bad table reaching main. Keep both.
 
+calibration.h
   1. every row has exactly 21 values,
   2. every open angle is in [SERVO_MIN_DEG, 180],
   3. the row / flag counts match LANDER_COUNT,
-  4. no two COMMITTED rows are identical  (i.e. a committed row is still a
-     leftover copy of the placeholder — the failure mode that ships one unit
-     with another unit's angles).
+  4. no two COMMITTED rows are identical (a committed row that is still a
+     leftover placeholder copy — the failure that ships one unit with another
+     unit's angles),
+  5. every SAMPLE channel (Ch0..19) reaches open + CLOSE_OFFSET_DEG without
+     being clamped at 180,
+  6. MAIN_CLOSE_DEG is in range and is above every unit's Ch20 open angle
+     (otherwise the main valve would "close" by moving toward open).
 
-Usage:  python tools/check_calibration.py [path/to/calibration.h]
+schedule.h
+  7. SAMPLE_TIME_S has exactly one entry per sample valve,
+  8. it is strictly increasing,
+  9. no two events are closer together than the sample routine takes to run.
+
+Usage:  python tools/check_calibration.py [include/calibration.h] [include/schedule.h]
 Exit 0 = OK, exit 1 = one or more checks failed.
 """
 
@@ -25,7 +37,7 @@ def strip_comments(text: str) -> str:
     out = []
     for line in text.split("\n"):
         i = line.find("//")
-        out.append(line[:i] if i >= 0 else line)              # // ...
+        out.append(line[:i] if i >= 0 else line)               # // ...
     return "\n".join(out)
 
 
@@ -34,79 +46,148 @@ def find_int(src: str, name: str, default=None):
     return int(m.group(1)) if m else default
 
 
-def parse(path: str):
-    raw = open(path, "r", encoding="utf-8").read()
-    src = strip_comments(raw)
+def find_array(src: str, name: str, dims: str):
+    """Return the flat list of ints inside `name[dims...] = { ... };`."""
+    m = re.search(rf"{name}\s*\[{dims}\]\s*=\s*\{{(.*?)\}}\s*;", src, flags=re.S)
+    return m.group(1) if m else None
 
-    lander_count = find_int(src, "LANDER_COUNT", default=4)
-    servo_min = find_int(src, "SERVO_MIN_DEG", default=70)
 
-    # CH_OPEN_DEG_ALL[...][21] = { {...}, {...}, ... };
-    m = re.search(
-        r"CH_OPEN_DEG_ALL\s*\[[^\]]*\]\s*\[\s*21\s*\]\s*=\s*\{(.*?)\}\s*;",
-        src, flags=re.S)
-    if not m:
+# ---------------------------------------------------------------- calibration.h
+def parse_calibration(path: str):
+    src = strip_comments(open(path, "r", encoding="utf-8").read())
+
+    cfg = {
+        "lander_count": find_int(src, "LANDER_COUNT", 4),
+        "servo_min": find_int(src, "SERVO_MIN_DEG", 70),
+        "close_offset": find_int(src, "CLOSE_OFFSET_DEG", 65),
+        "main_close": find_int(src, "MAIN_CLOSE_DEG"),
+        "main_ch": find_int(src, "MAIN_SERVO_CH", 20),
+        "sample_count": find_int(src, "SAMPLE_SERVO_COUNT", 20),
+    }
+
+    body = find_array(src, "CH_OPEN_DEG_ALL", r"[^\]]*\]\s*\[\s*21\s*")
+    if body is None:
         raise SystemExit("FAIL: could not find CH_OPEN_DEG_ALL[...][21] = { ... };")
     rows = [[int(x) for x in re.findall(r"\d+", grp)]
-            for grp in re.findall(r"\{([^{}]*)\}", m.group(1))]
+            for grp in re.findall(r"\{([^{}]*)\}", body)]
 
-    # CAL_COMMITTED[...] = { true, false, ... };
     c = re.search(r"CAL_COMMITTED\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}", src, flags=re.S)
     if not c:
         raise SystemExit("FAIL: could not find CAL_COMMITTED[...] = { ... };")
-    committed = [tok.strip() == "true"
-                 for tok in c.group(1).split(",") if tok.strip()]
+    committed = [tok.strip() == "true" for tok in c.group(1).split(",") if tok.strip()]
 
-    return lander_count, servo_min, rows, committed
+    return cfg, rows, committed
 
 
-def main(path: str) -> int:
-    lander_count, servo_min, rows, committed = parse(path)
-    errors, notes = [], []
+def check_calibration(path, errors, notes):
+    cfg, rows, committed = parse_calibration(path)
+    n, floor = cfg["lander_count"], cfg["servo_min"]
 
-    # (3) counts line up
-    if len(rows) != lander_count:
-        errors.append(f"CH_OPEN_DEG_ALL has {len(rows)} rows, expected LANDER_COUNT={lander_count}")
-    if len(committed) != lander_count:
-        errors.append(f"CAL_COMMITTED has {len(committed)} flags, expected LANDER_COUNT={lander_count}")
+    if len(rows) != n:
+        errors.append(f"CH_OPEN_DEG_ALL has {len(rows)} rows, expected LANDER_COUNT={n}")
+    if len(committed) != n:
+        errors.append(f"CAL_COMMITTED has {len(committed)} flags, expected LANDER_COUNT={n}")
 
-    # (1) + (2) shape and range, per row
     for i, row in enumerate(rows, start=1):
         if len(row) != 21:
-            errors.append(f"Lander {i}: {len(row)} values, expected 21")
+            errors.append(f"unit {i}: {len(row)} values, expected 21")
             continue
-        bad = [(ch, v) for ch, v in enumerate(row) if not (servo_min <= v <= 180)]
-        for ch, v in bad:
-            errors.append(f"Lander {i} Ch{ch}: open angle {v} out of range [{servo_min}, 180]")
+        for ch, v in enumerate(row):
+            if not (floor <= v <= 180):
+                errors.append(f"unit {i} Ch{ch}: open angle {v} out of range [{floor}, 180]")
+            # Sample channels must not clamp; Ch20 uses MAIN_CLOSE_DEG instead.
+            if ch < cfg["sample_count"] and v + cfg["close_offset"] > 180:
+                errors.append(
+                    f"unit {i} Ch{ch}: open {v} + CLOSE_OFFSET_DEG {cfg['close_offset']} "
+                    f"= {v + cfg['close_offset']} would clamp at 180")
 
-    # (4) committed rows must be pairwise distinct
-    committed_rows = [(i + 1, rows[i]) for i in range(min(len(rows), len(committed)))
-                      if committed[i]]
+    mc = cfg["main_close"]
+    if mc is None:
+        errors.append("MAIN_CLOSE_DEG not found in calibration.h")
+    else:
+        if not (floor <= mc <= 180):
+            errors.append(f"MAIN_CLOSE_DEG {mc} out of range [{floor}, 180]")
+        for i, row in enumerate(rows, start=1):
+            if len(row) > cfg["main_ch"] and mc <= row[cfg["main_ch"]]:
+                errors.append(
+                    f"unit {i}: MAIN_CLOSE_DEG {mc} <= Ch{cfg['main_ch']} open angle "
+                    f"{row[cfg['main_ch']]} — main valve would 'close' toward open")
+
+    committed_rows = [(i + 1, rows[i]) for i in range(min(len(rows), len(committed))) if committed[i]]
     for a in range(len(committed_rows)):
         for b in range(a + 1, len(committed_rows)):
             ia, ra = committed_rows[a]
             ib, rb = committed_rows[b]
             if ra == rb:
-                errors.append(
-                    f"Landers {ia} and {ib} are both COMMITTED but have identical angles "
-                    f"— one is still a placeholder copy")
+                errors.append(f"units {ia} and {ib} are both COMMITTED but have identical "
+                              f"angles — one is still a placeholder copy")
 
-    # informational: which units are ready
     for i in range(min(len(rows), len(committed))):
         state = "committed" if committed[i] else "placeholder (not deployable)"
-        notes.append(f"  Lander {i+1}: {state}")
+        notes.append(f"  unit {i+1}: {state}")
+    notes.append(f"  sample close = open + {cfg['close_offset']}°   ·   "
+                 f"main (Ch{cfg['main_ch']}) close = {mc}°")
+    return cfg
 
-    print(f"Checked {path}  (LANDER_COUNT={lander_count}, floor={servo_min}°)")
+
+# ------------------------------------------------------------------- schedule.h
+def check_schedule(path, cfg, errors, notes):
+    try:
+        src = strip_comments(open(path, "r", encoding="utf-8").read())
+    except FileNotFoundError:
+        errors.append(f"{path} not found")
+        return
+
+    routine = find_int(src, "ROUTINE_S", 126)
+    body = find_array(src, "SAMPLE_TIME_S", r"[^\]]*")
+    if body is None:
+        errors.append("could not find SAMPLE_TIME_S[...] = { ... };")
+        return
+    t = [int(x) for x in re.findall(r"\d+", body)]
+
+    expected = cfg.get("sample_count", 20)
+    if len(t) != expected:
+        errors.append(f"SAMPLE_TIME_S has {len(t)} entries, expected one per sample "
+                      f"valve (SAMPLE_SERVO_COUNT={expected})")
+
+    gaps = []
+    for i in range(1, len(t)):
+        gap = t[i] - t[i - 1]
+        gaps.append(gap)
+        if gap <= 0:
+            errors.append(f"SAMPLE_TIME_S is not strictly increasing at index {i} "
+                          f"({t[i-1]} -> {t[i]})")
+        elif gap <= routine:
+            errors.append(f"events {i} and {i+1} are {gap} s apart, which is not more "
+                          f"than the {routine} s sample routine")
+
+    if t and gaps:
+        notes.append(f"  {len(t)} events · first at {t[0]} s ({t[0]/3600:.2f} h) · "
+                     f"last at {t[-1]} s ({t[-1]/3600:.2f} h)")
+        notes.append(f"  mission length {t[-1] + routine} s "
+                     f"({(t[-1]+routine)/86400:.2f} d) · min gap {min(gaps)} s "
+                     f"({min(gaps)/3600:.2f} h) vs {routine} s routine")
+
+
+def main(cal_path: str, sched_path: str) -> int:
+    errors, notes = [], []
+    print(f"Checking {cal_path}")
+    cfg = check_calibration(cal_path, errors, notes)
+    print("\n".join(notes)); notes = []
+    print(f"\nChecking {sched_path}")
+    check_schedule(sched_path, cfg, errors, notes)
     print("\n".join(notes))
+
     if errors:
         print("\nFAILED:")
         for e in errors:
             print(f"  ✗ {e}")
         return 1
-    print("\nOK — calibration table is consistent.")
+    print("\nOK — calibration table and sample schedule are consistent.")
     return 0
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "include/calibration.h"
-    sys.exit(main(path))
+    cal = sys.argv[1] if len(sys.argv) > 1 else "include/calibration.h"
+    sch = sys.argv[2] if len(sys.argv) > 2 else "include/schedule.h"
+    sys.exit(main(cal, sch))

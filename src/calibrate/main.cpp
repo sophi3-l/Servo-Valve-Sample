@@ -37,6 +37,22 @@
 //  Procedure: nudge to the OPEN angle (fully open, no strain) → record it.
 //  Then try open+offset (≤65°) → confirm fully closed without grinding.
 //  Keep one CLOSE_OFFSET_DEG that works for every channel (65° is the limit).
+//
+//  CHANGES 2026-08-18 (calibration update):
+//    • The `table` command now calls the shared closeDegFor() from
+//      calibration.h instead of inlining open+CLOSE_OFFSET_DEG, so it prints
+//      the same close angle the deploy build will actually drive — including
+//      Ch20 (main), which does not use the offset formula at all.
+//
+//  CHANGES 2026-08-18b (main-valve stop margin):
+//    • Ch20's close angle is now MAIN_CLOSE_DEG (calibration.h), not 180.
+//      No change needed in this file — `table` already routes through
+//      closeDegFor() — but note that `table` is now the fastest way to check
+//      what the flight build will actually drive on the main valve.
+//    • BENCH TASK: MAIN_CLOSE_DEG is a starting value, not a confirmed one.
+//      Use `20 <MAIN_CLOSE_DEG>` then `r 20` here to drive the main valve to
+//      the candidate close angle and cut PWM, and confirm it seals fully and
+//      does not creep — at ~8 °C in oil, on each unit.
 // ============================================================================
 
 #include <Wire.h>
@@ -201,7 +217,7 @@ void loop() {
     Serial.println("ch | open deg/pulse | close deg/pulse");
     for (uint8_t i = 0; i <= 20; i++) {
       uint8_t o = show[i];
-      uint8_t c = (uint8_t)min((int)o + CLOSE_OFFSET_DEG, 180);
+      uint8_t c = closeDegFor(i, o);   // Ch20 (main) uses MAIN_CLOSE_DEG
       Serial.printf("%2u |   %3u / %4u   |   %3u / %4u%s\n",
                     i, o, degToPulse(o), c, degToPulse(c),
                     i == MAIN_SERVO_CH ? "   (MAIN)" : "");

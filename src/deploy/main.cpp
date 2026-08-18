@@ -1,41 +1,68 @@
 // ============================================================================
 //  Karen Valve Controller — FLIGHT / DEPLOY BUILD       (src/deploy/main.cpp)
 //  ESP32 DevKitC-32UE · 2× PCA9685 (0x40 / 0x41) · 21 Hiwonder HPS-2018 valves
-//  (main intake = Ch20 · sample valves = Ch0–19)
+//  (common/main intake = Ch20 · sample valves = Ch0–19)
 //
-//  Shared electrical truth (pins, PCA addresses, pulse mapping, calibration
-//  angles, close offset, channel layout, rail control, ≤2-servo guard) lives
-//  in include/calibration.h. Do not redefine any of it here.
+//  Electrical truth  -> include/calibration.h  (pins, angles, rail, guard)
+//  Mission timing    -> include/schedule.h     (Zach & Howard protocol)
+//  Do not redefine anything from either file here.
 //
-//  CHANGES vs the "deploy" draft (pre-flash review, 2026-07-30):
-//    • RAIL: the draft never drove GPIO25 — the mission would have sent PWM
-//      into a dead SERVO_RAIL and no valve would ever have moved. All drives
-//      now go through driveServo(), which calls railOn() (state-tracked, from
-//      calibration.h); every sleep path calls railOff() first. The old
-//      optional SERVO_RAIL_EN_PIN ifdef block is deleted — Q2 gating is not
-//      optional on this board.
-//    • LATCH: initPowerPins() is now the FIRST call in setup() (SHUTDOWN low =
-//      stay alive, rail off), same as the calibrate build.
-//    • GUARD: all drives route through the shared ≤2-active tracker. Every
-//      multi-servo operation (park, brownout recovery, web All-Open/Close/90°)
-//      is now strictly sequential: drive → settle → release → next. The draft
-//      held all 21 under PWM at once — the exact Q2 collapse latch from the
-//      bench sessions, and on the brownout-recovery path it would have looped.
-//    • Mission complete: park, then latchOff() (U10 cuts our own supply — true
-//      zero draw). Deep-sleep-forever remains only as the USB-powered fallback.
-//    • Testing-mode raw angle now clamps to SERVO_MIN_DEG (70°) like the
-//      calibrate CLI — commanding 0° into the mechanical stop is what stalled
-//      Ch20/Ch14 on the bench.
-//    • /settings rejects zero/absurd timing instead of arming a 0 ms interval.
+//  ============================ 2026-08-18c REWRITE ===========================
+//  The mission is now an ABSOLUTE SCHEDULE, not a fixed-interval loop. This
+//  changes almost everything below the servo primitives. What and why:
 //
-//  Deep-sleep rail safety relies on the R15/R13 copper pulldowns holding the
-//  Q1/Q2 gate chain off while GPIO25 floats (verified on Rev K). No gpio_hold
-//  needed; railOff() is still called before every sleep for a clean edge.
+//  • CLOCK. t=0 is power-on (deployment plug latches U10). Each sleep is
+//    computed as  next_event_time - elapsed_now,  so time spent awake comes
+//    out of the following sleep instead of pushing every later event back.
+//    Under the old fixed-delta scheme the ~126 s routine plus service windows
+//    would have accumulated well over an hour of lag across the mission.
 //
-//  NOTES (unchanged): passive hold must be bench-confirmed; main open during
-//  each wait; 18 h interval; 5.60 V park cutoff; brownout resumes with WiFi
-//  off while a fresh power-on enters ARM MODE; ~10 mA sleep floor is the
-//  DevKitC LDO+USB, not firmware. Testing Mode locks out arming.
+//  • NO OPERATOR ARM STEP. A fresh power-on self-arms (given a stamped unit ID
+//    and committed calibration) and starts the clock. This matches the Rev K
+//    deployment procedure — install plug, confirm, it runs — and the protocol
+//    sheet's own "seconds since powered on" origin. The web UI is now a
+//    SERVICE interface (check / abort), not the arming mechanism.
+//
+//  • ARM CONFIRMATION. LED1 now blinks on every fresh boot, before anything
+//    moves, which is what Rev K Section 16 step 3 actually asks for: proof the
+//    U10 latch caught. Previously the LED only blinked after a web button
+//    press, so an operator following the deck procedure would have seen
+//    nothing on plug-in and concluded the unit was dead.
+//
+//  • WIFI IS WINDOWED. 2.4 GHz does not propagate at 300 m, so a permanent AP
+//    would burn ~120 mA to talk to nobody. The AP comes up for AP_WINDOW_MS on
+//    boot, on unexpected resets, and after each sample event (never on a
+//    heartbeat wake), then drops. Note the old ARM MODE ran the AP with NO
+//    idle timeout at all — a latched unit left on deck overnight would have
+//    quietly eaten ~2.9 Ah, over 10% of the pack, before the mission started.
+//
+//  • RESUME ON ANY RESET. The old guard resumed only on ESP_RST_DEEPSLEEP or
+//    ESP_RST_BROWNOUT; a watchdog or panic mid-mission fell through to the AP
+//    and the mission stopped forever, unheard, at depth. Any reset now resumes.
+//
+//  • LOW BATTERY NO LONGER ACTUATES. The old low-battery path called
+//    parkAllClosed() — 21 actuations, i.e. it responded to a weak pack by
+//    performing the single largest actuation in the firmware. Valves already
+//    hold their positions passively, so a low battery now logs, skips the
+//    event, and sleeps without touching the rail.
+//
+//  • RESTING STATE. Common (Ch20) rests OPEN and is closed only for the 124 s
+//    inside a sample event. Startup parks the 20 SAMPLE valves closed and then
+//    opens common, which is the state every event's step 1 assumes.
+//
+//  • MISSION END. Each event closes its own sample valve, and the last event
+//    ends with common open — so the desired end state already exists and there
+//    is no final park. Dropping it also avoids 20 actuations at the lowest-
+//    battery moment of the mission, which is when a stall is most likely.
+//
+//  Unchanged: ≤2-servo guard, rail gating via GPIO25, PCA sleep before deep
+//  sleep, R15/R13 copper pulldowns hold the gate chain off while GPIO25
+//  floats, latchOff() ends the mission on battery (deep-sleep tail is the
+//  USB/no-latch bench fallback only).
+//
+//  NOT YET BENCH-CONFIRMED: MAIN_CLOSE_DEG (calibration.h), the low-battery
+//  cutoff below (Rev K Section 15 item 2 — needs the 8 degC discharge test),
+//  and passive hold.
 // ============================================================================
 
 #include <Arduino.h>
@@ -47,64 +74,70 @@
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <driver/gpio.h>
-#include "calibration.h"          // shared: pins, mapping, angles, channels
+#include "calibration.h"
+#include "schedule.h"
 
-// Build-specific spellings mapped onto the shared names in calibration.h
 #define ARM_LED_PIN  LED_PIN
 #define SERVO_FREQ   SERVO_FREQ_HZ
 
-// ── Network (ARM MODE only — never started on a mission wake) ────────────────
-// SSID is built from the per-unit ID at boot (loadUnitId): LanderController1..4,
-// or LanderController-UNSET if no ID has been stamped into NVS yet.
+// ── Network (service windows only — never up during a sleep) ─────────────────
 const char* AP_PASSWORD = "lander1234";
 char        apSsid[32]  = "LanderController-UNSET";
 
-// ── Per-unit identity (set once on the bench via the calibrate build's setid) ─
-uint8_t         g_unitId = 0;        // 1..LANDER_COUNT; 0 = unset
-bool            g_idOk   = false;    // valid ID AND calibration committed
-const uint8_t*  CH_OPEN  = nullptr;  // this unit's open-angle row (selected below)
-
-// ── Battery guard (deploy-specific) ──────────────────────────────────────────
-const float   VBATT_CUTOFF_V      = 5.60f;     // park below this
-const float   VBATT_PLAUSIBLE_MIN = 3.00f;     // below → assume sense fault, ignore
-const uint8_t VBATT_SAMPLES       = 16;
-
-// ── ARM window + timing (ms) — defaults; overwritten from NVS at arm time ────
-//  MINI_DEPLOY (env:minideploy) compresses these so a full 20-sample run takes
-//  minutes, not weeks — SAME flight code path, short clock. Real deploy is
-//  untouched. The web UI can still override any of these before arming.
+// Service window length. Costs ~120 mA while up. At 5 min x ~21 windows that
+// is ~0.25 Ah of a 24 Ah pack (~1%). MINI is short on purpose: at flight
+// length the windows would be longer than the entire rehearsal.
+//  Two lengths, because they serve different purposes. The BOOT window is the
+//  deck check and the operator's only chance to abort before valves move, so
+//  it must be long enough to actually join the AP and load the page. The
+//  per-EVENT windows are opportunistic (post-recovery access) and can be short.
 #ifdef MINI_DEPLOY
-const uint32_t ARM_BLINK_MS    = 8000;         //  8 s  (test only — not a real seal window)
-uint32_t STARTUP_DELAY_MS      = 3000;         //  3 s
-uint32_t SERVO_OPEN_TIME_MS    = 2000;         //  2 s
-uint32_t INTER_SAMPLE_DELAY_MS = 15000UL;      // 15 s  → full run ≈ 5–6 min
+const uint32_t AP_BOOT_WINDOW_MS = 60000;   // 60 s — enough to join WiFi
+const uint32_t AP_WINDOW_MS      = 10000;   // 10 s between rehearsal events
+const uint32_t LED_CONFIRM_MS    = 8000;    // 8 s
 #else
-const uint32_t ARM_BLINK_MS    = 45000;        // 30–60 s per design
-uint32_t STARTUP_DELAY_MS      = 10000;        // slept after arm, before 1st sample
-uint32_t SERVO_OPEN_TIME_MS    = 5000;         // sample valve open duration
-uint32_t INTER_SAMPLE_DELAY_MS = 64800000UL;   // 18 h
+const uint32_t AP_BOOT_WINDOW_MS = 300000;  // 5 min — matches the protocol's
+                                            // 5 min deck allowance (the 3300 s
+                                            // offset between the two sheets)
+const uint32_t AP_WINDOW_MS      = 300000;  // 5 min after each sample event
+const uint32_t LED_CONFIRM_MS    = 45000;   // 45 s, per Rev K "30-60 s"
 #endif
+// If the operator aborts the mission, the AP stays up for bench work — but
+// bounded, so a unit left disarmed on deck cannot drain the pack unnoticed.
+const uint32_t BENCH_IDLE_MS  = 3600000UL;  // 1 h
 
-const uint16_t SERVO_SETTLE_MS = 500;          // drive, then cut PWM after this
+// ── Per-unit identity ────────────────────────────────────────────────────────
+uint8_t         g_unitId = 0;
+bool            g_idOk   = false;
+const uint8_t*  CH_OPEN  = nullptr;
+
+// ── Battery guard ────────────────────────────────────────────────────────────
+//  Pack is 2x Power-Sonic PS-6100 in PARALLEL: 6 V nominal, 24 Ah.
+//  NOTE the servos (HPS-2018) are rated 6.0-8.4 V, so on a 6 V SLA they sit at
+//  or below their minimum rating for most of the discharge. That cannot be
+//  fixed by moving this threshold — it is a pack/servo choice — but it is why
+//  the settle times matter and why MAIN_CLOSE_DEG backs off the stop.
+//  5.60 V is INHERITED, NOT VALIDATED. Rev K Section 15 item 2 requires it to
+//  come from an 8 degC discharge test with the real load. Read at wake with
+//  the rail off, i.e. a rested reading — the right condition for SoC.
+const float   VBATT_CUTOFF_V      = 5.60f;
+const float   VBATT_PLAUSIBLE_MIN = 3.00f;   // below -> assume sense fault
+const uint8_t VBATT_SAMPLES       = 16;
 
 uint16_t chOpenPulse[21];
 uint16_t chClosePulse[21];
 
-// ── Persistent mission state ──────────────────────────────────────────────────
-#define STATE_MAGIC 0xC0FFEE01
-RTC_DATA_ATTR uint32_t rtcMagic         = 0;
-RTC_DATA_ATTR uint8_t  rtcNextSampleIdx = 0;
-RTC_DATA_ATTR uint8_t  rtcPhase         = 0;
-RTC_DATA_ATTR bool     rtcMissionDone   = false;
-
-enum Phase { PHASE_WARMUP = 0, PHASE_SAMPLING = 1 };
+// ── Persistent mission state ─────────────────────────────────────────────────
+#define STATE_MAGIC 0xC0FFEE02
+RTC_DATA_ATTR uint32_t rtcMagic     = 0;
+RTC_DATA_ATTR uint32_t rtcElapsedS  = 0;
+RTC_DATA_ATTR uint8_t  rtcEvtIdx    = 0;
 
 struct MissionState {
   bool     armed;
-  uint8_t  nextSampleIdx;
-  uint8_t  phase;
-  bool     missionComplete;
-  uint32_t startupMs, openMs, interMs;
+  bool     complete;
+  uint8_t  evtIdx;        // next event to run, 0..EVENT_COUNT
+  uint32_t elapsedS;      // mission seconds at the last persisted point
 };
 MissionState st;
 Preferences prefs;
@@ -117,21 +150,33 @@ enum ServoPos { POS_CLOSE, POS_MID, POS_OPEN };
 ServoPos servoPositions[21];
 bool     servoHasPWM[21];
 
-bool     armPending = false;
-uint32_t armStartMs = 0;
-bool     testMode   = false;
+bool     testMode     = false;
+bool     g_benchMode  = false;   // aborted / unarmable: stay awake on the AP
+bool     g_windowBreak    = false;  // an operator action ended the service window
+bool     g_operatorAborted = false; // ...and it was an abort, so do NOT re-arm
+uint32_t g_elapsedAtWake = 0;    // mission seconds at the instant we woke
+uint32_t g_millisBase    = 0;    // millis() value that g_elapsedAtWake refers to
+uint32_t g_benchStartMs  = 0;
+float    g_lastVbatt     = 0.0f;
+esp_reset_reason_t g_resetReason = ESP_RST_UNKNOWN;
 
-// ── Servo primitives ──────────────────────────────────────────────────────────
-// Raw PCA write. NO POLICY HERE — everything must route through driveServo() /
-// releaseServo() so the ≤2-active guard and the Q2 rail stay coherent.
+// Mission seconds right now. millis() is this-boot-only; g_elapsedAtWake
+// carries everything before it. g_millisBase lets the origin be re-anchored
+// mid-boot (operator restart) without unsigned-underflow tricks.
+uint32_t missionElapsedS() { return g_elapsedAtWake + ((millis() - g_millisBase) / 1000UL); }
+
+// Re-anchor the mission clock so missionElapsedS() reads `elapsedS` right now.
+void setMissionElapsed(uint32_t elapsedS) {
+  g_elapsedAtWake = elapsedS;
+  g_millisBase    = millis();
+}
+
+// ── Servo primitives (unchanged policy: everything routes through these) ─────
 void setPWM(uint8_t ch, uint16_t pulse) {
   if (ch < 16) pwm0.setPWM(ch, 0, pulse);
   else         pwm1.setPWM(ch - 16, 0, pulse);
 }
 
-// Guarded drive: refuse if a 3rd concurrent servo is requested (structural
-// ≤2 rule from calibration.h), otherwise signal first, then energize the rail.
-// railOn() is state-tracked and idempotent — a no-op if already on.
 bool driveServo(uint8_t ch, uint16_t pulse, ServoPos pos, const char* tag, uint8_t degForLog) {
   if (!servoGuardAllows(ch)) {
     Serial.printf("[GUARD] Ch%2d refused — %u already active (", ch, servoActiveCount());
@@ -156,18 +201,12 @@ void releaseServo(uint8_t ch) {
 }
 void releaseAll() { for (uint8_t ch = 0; ch <= 20; ch++) releaseServo(ch); }
 
-void openServo(uint8_t ch) {
-  driveServo(ch, chOpenPulse[ch], POS_OPEN, "OPEN ", CH_OPEN[ch]);
-}
-void closeServo(uint8_t ch) {
-  uint8_t closeDeg = min((int)CH_OPEN[ch] + CLOSE_OFFSET_DEG, 180);
-  driveServo(ch, chClosePulse[ch], POS_CLOSE, "CLOSE", closeDeg);
-}
-void midServo(uint8_t ch) {
-  driveServo(ch, degToPulse(90), POS_MID, "MID  ", 90);
-}
-// Bench-only raw jog (ignores the 65° close offset, NOT the 70° mechanical
-// floor — commanding below SERVO_MIN_DEG is what stalled Ch20/Ch14 on bench).
+void openServo(uint8_t ch)  { driveServo(ch, chOpenPulse[ch],  POS_OPEN,  "OPEN ", CH_OPEN[ch]); }
+void closeServo(uint8_t ch) { driveServo(ch, chClosePulse[ch], POS_CLOSE, "CLOSE", closeDegFor(ch, CH_OPEN[ch])); }
+void midServo(uint8_t ch)   { driveServo(ch, degToPulse(90),   POS_MID,   "MID  ", 90); }
+
+// Bench-only raw jog. Clamps the 70° mechanical floor (commanding below it is
+// what stalled Ch20/Ch14 on the bench) — the offset is deliberately ignored.
 void angleServo(uint8_t ch, uint8_t deg) {
   if (deg < SERVO_MIN_DEG) deg = SERVO_MIN_DEG;
   driveServo(ch, degToPulse(deg), POS_MID, "TEST ", deg);
@@ -183,25 +222,25 @@ void sweepServo(uint8_t ch) {
   delay(150);
   releaseServo(ch);
 }
-uint8_t activePWMCount() { uint8_t n=0; for (uint8_t ch=0; ch<=20; ch++) if (servoHasPWM[ch]) n++; return n; }
 
-// Sequential multi-servo move: ONE servo under power at a time — drive,
-// settle, release, next. This is the only sanctioned way to touch many valves;
-// the certified power path is 2 concurrent servos (0.227 A), never 21.
-void moveAllSequential(void (*op)(uint8_t)) {
-  for (uint8_t ch = 0; ch <= 20; ch++) {
+// One servo under power at a time: drive → settle → release → breather.
+// The trailing STEP_GAP_MS mirrors the protocol's release→next-command spacing
+// and keeps consecutive inrush events off the C1 bank. A 21-channel march is
+// where that matters most.
+void moveRangeSequential(uint8_t first, uint8_t last, void (*op)(uint8_t)) {
+  for (uint8_t ch = first; ch <= last; ch++) {
     op(ch);
-    delay(SERVO_SETTLE_MS);
+    delay(STEP_SETTLE_MS);
     releaseServo(ch);
+    delay(STEP_GAP_MS);
   }
 }
 
-// ── Hardware init helpers ─────────────────────────────────────────────────────
+// ── Hardware init ────────────────────────────────────────────────────────────
 void buildPulseTables() {
   for (uint8_t i = 0; i <= 20; i++) {
     chOpenPulse[i]   = degToPulse(CH_OPEN[i]);
-    uint8_t closeDeg = min((int)CH_OPEN[i] + CLOSE_OFFSET_DEG, 180);
-    chClosePulse[i]  = degToPulse(closeDeg);
+    chClosePulse[i]  = degToPulse(closeDegFor(i, CH_OPEN[i]));   // Ch20 → MAIN_CLOSE_DEG
     servoPositions[i] = POS_CLOSE;
   }
 }
@@ -214,181 +253,141 @@ void initServoDrivers() {
   delay(10);
 }
 void sleepServoDrivers() { pwm0.sleep(); pwm1.sleep(); }
-void initBatteryAdc() { analogSetPinAttenuation(VBATT_SENSE_PIN, ADC_11db); }
+void initBatteryAdc()    { analogSetPinAttenuation(VBATT_SENSE_PIN, ADC_11db); }
 float readBatteryVoltage() {
   uint32_t acc = 0;
   for (uint8_t i = 0; i < VBATT_SAMPLES; i++) { acc += analogReadMilliVolts(VBATT_SENSE_PIN); delay(2); }
-  return ((acc / (float)VBATT_SAMPLES) / 1000.0f) / VBATT_DIVIDER_RATIO;
+  g_lastVbatt = ((acc / (float)VBATT_SAMPLES) / 1000.0f) / VBATT_DIVIDER_RATIO;
+  return g_lastVbatt;
+}
+bool batteryTooLow(float vb) { return (vb >= VBATT_PLAUSIBLE_MIN && vb < VBATT_CUTOFF_V); }
+
+// ── Mission-level valve actions ──────────────────────────────────────────────
+// Resting state: 20 sample valves CLOSED, common OPEN. Every sample event's
+// step 1 ("close common") assumes common is open when it starts.
+void establishRestingState() {
+  Serial.println("[VALVE] resting state: close 20 sample valves, then open common");
+  moveRangeSequential(0, SAMPLE_SERVO_COUNT - 1, closeServo);
+  openServo(MAIN_SERVO_CH);
+  delay(STEP_SETTLE_MS);
+  releaseServo(MAIN_SERVO_CH);
+  railOff();
 }
 
-// ── Mission-level valve actions ───────────────────────────────────────────────
-void parkAllClosed() {
-  Serial.println("[VALVE] park: sequential close (one servo powered at a time)");
-  moveAllSequential(closeServo);
-}
-void openMainAndHold() { openServo(MAIN_SERVO_CH); delay(SERVO_SETTLE_MS); releaseServo(MAIN_SERVO_CH); }
-void releaseAllSamples() { for (uint8_t i=0; i<SAMPLE_SERVO_COUNT; i++) releaseServo(SERVO_CHANNELS[i]); }
-void takeSample(uint8_t idx) {
+// The protocol's 8-command routine, literal (see schedule.h):
+//   0 close common / 2 release / 4 open sample / 6 release
+//   120 close sample / 122 release / 124 open common / 126 release
+void runSampleEvent(uint8_t idx) {
   uint8_t ch = SERVO_CHANNELS[idx];
-  closeServo(MAIN_SERVO_CH); delay(SERVO_SETTLE_MS); releaseServo(MAIN_SERVO_CH);
-  openServo(ch); delay(SERVO_SETTLE_MS); releaseServo(ch);
-  uint32_t hold = (SERVO_OPEN_TIME_MS > SERVO_SETTLE_MS) ? SERVO_OPEN_TIME_MS - SERVO_SETTLE_MS : 0;
-  delay(hold);
-  closeServo(ch); delay(SERVO_SETTLE_MS); releaseServo(ch);
+  Serial.printf("[EVENT] sample %u/%u  Ch%u  (t=%lu s)\n",
+                idx + 1, EVENT_COUNT, ch, (unsigned long)missionElapsedS());
+
+  closeServo(MAIN_SERVO_CH); delay(STEP_SETTLE_MS); releaseServo(MAIN_SERVO_CH);
+  delay(STEP_GAP_MS);
+
+  openServo(ch);             delay(STEP_SETTLE_MS); releaseServo(ch);
+  delay(SAMPLE_DWELL_MS);                            // sample valve open, unpowered
+
+  closeServo(ch);            delay(STEP_SETTLE_MS); releaseServo(ch);
+  delay(STEP_GAP_MS);
+
+  openServo(MAIN_SERVO_CH);  delay(STEP_SETTLE_MS); releaseServo(MAIN_SERVO_CH);
+
+  railOff();
+  Serial.printf("[EVENT] sample %u done (t=%lu s)\n", idx + 1, (unsigned long)missionElapsedS());
 }
 
-// ── Persistence ───────────────────────────────────────────────────────────────
-void saveState() {
+// ── Persistence ──────────────────────────────────────────────────────────────
+void saveState(uint32_t elapsedS) {
+  st.elapsedS = elapsedS;
   prefs.begin("karen", false);
   prefs.putBool ("armed",   st.armed);
-  prefs.putUChar("idx",     st.nextSampleIdx);
-  prefs.putUChar("phase",   st.phase);
-  prefs.putBool ("done",    st.missionComplete);
-  prefs.putUInt ("startup", st.startupMs);
-  prefs.putUInt ("open",    st.openMs);
-  prefs.putUInt ("inter",   st.interMs);
+  prefs.putBool ("done",    st.complete);
+  prefs.putUChar("evt",     st.evtIdx);
+  prefs.putUInt ("elapsed", st.elapsedS);
   prefs.end();
-  rtcMagic = STATE_MAGIC; rtcNextSampleIdx = st.nextSampleIdx;
-  rtcPhase = st.phase;    rtcMissionDone   = st.missionComplete;
+  rtcMagic = STATE_MAGIC; rtcElapsedS = st.elapsedS; rtcEvtIdx = st.evtIdx;
 }
 void loadState() {
   prefs.begin("karen", true);
-  st.armed           = prefs.getBool ("armed",   false);
-  st.nextSampleIdx   = prefs.getUChar("idx",     0);
-  st.phase           = prefs.getUChar("phase",   PHASE_WARMUP);
-  st.missionComplete = prefs.getBool ("done",    false);
-  st.startupMs       = prefs.getUInt ("startup", STARTUP_DELAY_MS);
-  st.openMs          = prefs.getUInt ("open",    SERVO_OPEN_TIME_MS);
-  st.interMs         = prefs.getUInt ("inter",   INTER_SAMPLE_DELAY_MS);
+  st.armed    = prefs.getBool ("armed",   false);
+  st.complete = prefs.getBool ("done",    false);
+  st.evtIdx   = prefs.getUChar("evt",     0);
+  st.elapsedS = prefs.getUInt ("elapsed", 0);
   prefs.end();
-  if (rtcMagic == STATE_MAGIC && rtcNextSampleIdx != st.nextSampleIdx)
-    Serial.printf("[STATE] RTC idx %u != NVS idx %u — trusting NVS\n", rtcNextSampleIdx, st.nextSampleIdx);
-  STARTUP_DELAY_MS      = st.startupMs;
-  SERVO_OPEN_TIME_MS    = st.openMs;
-  INTER_SAMPLE_DELAY_MS = st.interMs;
 }
 
-// Read the per-unit ID (stamped on the bench via the calibrate build's setid),
-// select this unit's calibration row, and build its SSID. Fails safe: an unset
-// or uncommitted unit falls back to row 0 for math (so nothing null-derefs) but
-// g_idOk stays false, which blocks arming and shows UNSET on the web UI.
 void loadUnitId() {
   prefs.begin("karen", true);
   g_unitId = prefs.getUChar("unitid", 0);
   prefs.end();
-
   const uint8_t* row = chOpenRow(g_unitId);
-  g_idOk = (row != nullptr) && calCommitted(g_unitId);
+  g_idOk  = (row != nullptr) && calCommitted(g_unitId);
   CH_OPEN = row ? row : CH_OPEN_DEG_ALL[0];   // row-0 fallback keeps math safe
-
 #ifdef MINI_DEPLOY
-  const char* ssidTag = "-TEST";   // mark test firmware on the deck — DO NOT SEAL
+  const char* ssidTag = "-TEST";              // DO NOT SEAL
 #else
   const char* ssidTag = "";
 #endif
   if (row) snprintf(apSsid, sizeof(apSsid), "LanderController%u%s", g_unitId, ssidTag);
   else     snprintf(apSsid, sizeof(apSsid), "LanderController-UNSET%s", ssidTag);
-
   Serial.printf("[ID]    unit=%u  cal=%s  ssid=%s\n",
                 g_unitId, g_idOk ? "committed" : "MISSING/placeholder", apSsid);
 }
 
-// ── Deep sleep ────────────────────────────────────────────────────────────────
-void radiosOff() { WiFi.mode(WIFI_OFF); /* BT never started */ }
-
-void enterDeepSleep(uint64_t us) {
-  digitalWrite(ARM_LED_PIN, LOW);
-  releaseAll();               // no PWM into a rail we're about to drop
-  railOff();                  // clean edge; R15/R13 hold the gate off in sleep
-  sleepServoDrivers();
-  Serial.printf("[SLEEP] deep sleep %llu s\n", us / 1000000ULL);
-  Serial.flush();
-  esp_sleep_enable_timer_wakeup(us);
-  esp_deep_sleep_start();
+// ── Sleep ────────────────────────────────────────────────────────────────────
+void radiosOff() {
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
 }
 
-// Mission complete: cut our own supply via the U10 latch. On battery, power
-// ends inside latchOff()'s delay and nothing below it runs. The deep-sleep
-// tail is the USB-on-bench fallback only (USB back-feed keeps us alive).
-void enterDeepSleepForever() {
+void enterDeepSleepS(uint32_t seconds) {
+  // Persist BEFORE sleeping, including the sleep we are about to perform, so
+  // the elapsed clock is correct the instant we wake.
+  saveState(missionElapsedS() + seconds);
   digitalWrite(ARM_LED_PIN, LOW);
   releaseAll();
   railOff();
   sleepServoDrivers();
-  Serial.println("[SLEEP] mission complete — latching power off (U10)");
+  radiosOff();
+  Serial.printf("[SLEEP] %lu s  (elapsed will be %lu s, next event %u/%u)\n",
+                (unsigned long)seconds, (unsigned long)st.elapsedS,
+                st.evtIdx + 1, EVENT_COUNT);
   Serial.flush();
-  latchOff();                 // ← execution normally ends here on battery
+  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
+// Mission complete: no park — every sample valve was closed by its own event
+// and common is open, which is the intended recovery state.
+void endMission() {
+  st.complete = true; st.armed = false;
+  saveState(missionElapsedS());
+  digitalWrite(ARM_LED_PIN, LOW);
+  releaseAll();
+  railOff();
+  sleepServoDrivers();
+  radiosOff();
+  Serial.printf("[DONE]  all %u samples collected; common left OPEN; elapsed %lu s\n",
+                EVENT_COUNT, (unsigned long)st.elapsedS);
+  Serial.println("[DONE]  latching power off (U10)");
+  Serial.flush();
+  latchOff();                 // ← on battery, execution ends inside this delay
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
-  Serial.println("[SLEEP] still alive (USB) — deep sleep until reset/recovery");
+  Serial.println("[DONE]  still alive (USB / latch not wired) — deep sleep until reset");
   Serial.flush();
   esp_deep_sleep_start();
 }
 
-// ── Mission wake ───────────────────────────────────────────────────────────────
-void runMissionWake(esp_sleep_wakeup_cause_t cause) {
-  radiosOff();
-  // Rail stays OFF until the first driveServo() call — the battery check and
-  // logging below run at sleep-level draw, and a low battery never actuates.
-  buildPulseTables();
-  initBatteryAdc();
-  initServoDrivers();
-
-  float vb = readBatteryVoltage();
-  Serial.printf("[WAKE]  cause=%d idx=%u phase=%u Vbatt=%.2f V\n",
-                cause, st.nextSampleIdx, st.phase, vb);
-
-  if (vb >= VBATT_PLAUSIBLE_MIN && vb < VBATT_CUTOFF_V) {
-    Serial.println("[WAKE]  LOW BATTERY → park, no actuation");
-    parkAllClosed();
-    enterDeepSleep((uint64_t)INTER_SAMPLE_DELAY_MS * 1000ULL);
-  }
-
-  if (cause != ESP_SLEEP_WAKEUP_TIMER) {
-    // Sequential on purpose: this path runs right after a brownout — slamming
-    // 20 servos at once here is how the Q2 collapse latch becomes a boot loop.
-    Serial.println("[WAKE]  unexpected reset mid-mission → re-establish state (sequential)");
-    for (uint8_t i = 0; i < SAMPLE_SERVO_COUNT; i++) {
-      closeServo(SERVO_CHANNELS[i]);
-      delay(SERVO_SETTLE_MS);
-      releaseServo(SERVO_CHANNELS[i]);
-    }
-    if (st.phase == PHASE_WARMUP) enterDeepSleep((uint64_t)STARTUP_DELAY_MS * 1000ULL);
-    else { openMainAndHold(); enterDeepSleep((uint64_t)INTER_SAMPLE_DELAY_MS * 1000ULL); }
-  }
-
-  if (st.phase == PHASE_WARMUP) {
-    Serial.println("[WAKE]  warmup done → open main, begin flush");
-    openMainAndHold();
-    st.phase = PHASE_SAMPLING; saveState();
-    enterDeepSleep((uint64_t)INTER_SAMPLE_DELAY_MS * 1000ULL);
-  } else {
-    Serial.printf("[WAKE]  sample %u/%u (Ch%u)\n",
-                  st.nextSampleIdx + 1, SAMPLE_SERVO_COUNT, SERVO_CHANNELS[st.nextSampleIdx]);
-    takeSample(st.nextSampleIdx);
-    st.nextSampleIdx++;
-    if (st.nextSampleIdx >= SAMPLE_SERVO_COUNT) {
-      st.missionComplete = true; saveState();
-      Serial.println("[WAKE]  ALL SAMPLES COLLECTED → park, sleep until recovery");
-      parkAllClosed();
-      enterDeepSleepForever();
-    } else {
-      openMainAndHold(); saveState();
-      enterDeepSleep((uint64_t)INTER_SAMPLE_DELAY_MS * 1000ULL);
-    }
-  }
-
-  enterDeepSleep((uint64_t)INTER_SAMPLE_DELAY_MS * 1000ULL);  // defensive catch-all
-}
-
-// ── Web UI (ARM MODE / bench only) ────────────────────────────────────────────
+// ── Web UI ───────────────────────────────────────────────────────────────────
 const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lander — Arm</title>
+<title>Lander — Service</title>
 <style>
   :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;
-        --blue:#58a6ff;--green:#238636;--red:#da3633;--orange:#f0883e;--yellow:#9e6a03;--grey:#30363d;}
+        --blue:#58a6ff;--green:#238636;--red:#da3633;--orange:#f0883e;--grey:#30363d;}
   *{box-sizing:border-box;}
   body{font-family:monospace;background:var(--bg);color:var(--text);padding:16px;max-width:620px;margin:0 auto;}
   h2{color:var(--blue);font-size:13px;text-transform:uppercase;letter-spacing:.08em;margin:0 0 8px;}
@@ -396,6 +395,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
   .status{text-align:center;} .state{font-size:18px;font-weight:bold;color:var(--blue);}
   .batt{font-size:34px;font-weight:bold;color:var(--orange);line-height:1.1;margin-top:4px;}
   .prog{font-size:13px;color:var(--dim);margin-top:3px;}
+  .win{font-size:12px;color:var(--orange);margin-top:6px;}
   .row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;}
   button{flex:1;min-width:60px;padding:9px 6px;border:none;border-radius:5px;font-size:13px;font-weight:bold;cursor:pointer;}
   .g{background:var(--green);color:#fff;} .r{background:var(--red);color:#fff;}
@@ -408,18 +408,32 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
   .sc.open .sc-pos{color:#3fb950;} .sc.closed .sc-pos{color:#f85149;}
   .sc button{min-width:unset;padding:4px 2px;font-size:11px;flex:1;}
   label{font-size:11px;color:var(--dim);display:block;margin-bottom:3px;}
-  input[type=number],select{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px 8px;width:100%;font-size:13px;}
-  input.dirty{border-color:var(--orange);}
+  select,input[type=number],input[type=range]{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px 8px;width:100%;font-size:13px;}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
-  .hms-row{display:flex;gap:4px;} .hms-row input{text-align:center;}
-  .hms-label{display:flex;justify-content:space-between;align-items:baseline;} .hms-hint{font-size:10px;color:#555;}
+  .hms-row{display:flex;gap:4px;}
+  .kv{display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-bottom:1px solid #21262d;}
+  .kv span:first-child{color:var(--dim);}
   .note{font-size:11px;color:var(--dim);margin-bottom:8px;} .warn{font-size:11px;color:var(--orange);margin:6px 0 10px;}
   .sep{border:none;border-top:1px solid #21262d;margin:12px 0;}
-  .apply-row{display:flex;gap:8px;align-items:center;} .apply-row button{flex:1;padding:10px;}
-  #apply-status,#arm-status{font-size:11px;color:var(--dim);} .arm-btn{padding:14px;font-size:15px;}
+  #act-status{font-size:11px;color:var(--dim);} .arm-btn{padding:14px;font-size:15px;}
+  .banner{background:#3d1f00;border:1px solid var(--orange);color:var(--orange);border-radius:6px;
+          padding:8px;text-align:center;font-size:12px;font-weight:bold;margin-bottom:12px;display:none;}
 </style></head><body>
 
-<div class="card status"><div class="state" id="st">--</div><div class="prog" id="unit"></div><div class="batt" id="vb">-- V</div><div class="prog" id="pg"></div></div>
+<div class="banner" id="mini">MINI-DEPLOY TEST BUILD — compressed schedule — DO NOT SEAL</div>
+
+<div class="card status"><div class="state" id="st">--</div><div class="prog" id="unit"></div>
+  <div class="batt" id="vb">-- V</div><div class="prog" id="pg"></div>
+  <div class="win" id="win"></div></div>
+
+<h2>Schedule</h2>
+<div class="card">
+  <div class="kv"><span>Mission elapsed</span><span id="k-elapsed">--</span></div>
+  <div class="kv"><span>Next event</span><span id="k-next">--</span></div>
+  <div class="kv"><span>Time to next event</span><span id="k-eta">--</span></div>
+  <div class="kv"><span>Mission length</span><span id="k-end">--</span></div>
+  <div class="note" style="margin:8px 0 0">Schedule is compiled in from the sampling protocol and cannot be edited here.</div>
+</div>
 
 <h2>Servos</h2><div class="note" id="offset-note"></div><div class="servo-grid" id="grid"></div>
 <div class="row">
@@ -428,26 +442,15 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
   <button class="gr" onclick="cmd('cal_all_mid')">All 90°</button>
   <button class="gr" onclick="cmd('cal_all_release')">Release All</button>
 </div>
-
-<hr class="sep"><h2>Timing</h2>
-<div class="grid2" style="margin-bottom:10px">
-  <div><label>Startup delay (ms)</label><input type="number" id="t_start" step="500" min="0"></div>
-  <div><label>Sample open time (ms)</label><input type="number" id="t_open" step="100" min="100"></div>
-</div>
-<div style="margin-bottom:10px"><div class="hms-label"><label>Inter-sample interval</label>
-  <span class="hms-hint">h : mm : ss · 18 hr = 18 : 00 : 00</span></div>
-  <div class="hms-row"><input type="number" id="t_h" placeholder="h" min="0" max="99">
-  <input type="number" id="t_m" placeholder="mm" min="0" max="59">
-  <input type="number" id="t_sec" placeholder="ss" min="0" max="59"></div></div>
-<div class="apply-row"><button class="b" onclick="applySettings()">Apply Timing</button><span id="apply-status"></span></div>
+<div class="row"><button class="b" onclick="cmd('rest')">Set resting state (samples closed · common open)</button></div>
 
 <hr class="sep"><h2>Testing Mode</h2>
-<div class="note">Bench bring-up — one servo at a time. Arming is locked while this is on; exit to arm.</div>
+<div class="note">Bench bring-up — one servo at a time. Aborts the mission while on; exit and restart to re-arm.</div>
 <div class="row"><button class="b" id="tm-btn" onclick="toggleTest()">Enter Testing Mode</button></div>
 <div id="tm-panel" style="display:none">
   <div class="grid2" style="margin-bottom:10px">
     <div><label>Channel under test</label><select id="tm-ch"></select></div>
-    <div><label>Raw angle · 0–180° · ignores 65° limit</label>
+    <div><label>Raw angle · clamped to 70° floor</label>
       <div class="hms-row"><input type="range" id="tm-deg" min="0" max="180" value="90" style="flex:2"
         oninput="document.getElementById('tm-degv').value=this.value">
         <input type="number" id="tm-degv" min="0" max="180" value="90" style="max-width:60px"
@@ -463,27 +466,27 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     <button class="gr" onclick="thold('close')">Hold-check · closed</button>
     <button class="gr" onclick="thold('open')">Hold-check · open</button>
   </div>
-  <div class="warn">Hold-check drives to position, cuts PWM, leaves it limp — watch for creep. This is the passive-hold test the deep-sleep budget depends on.</div>
+  <div class="warn">Hold-check drives to position, cuts PWM, leaves it limp — watch for creep. This is the passive-hold test the deep-sleep budget depends on. For MAIN (Ch20), hold-check · closed is also the MAIN_CLOSE_DEG seal check.</div>
 </div>
 
-<hr class="sep"><h2>Arm / Deploy</h2>
-<div class="warn">Arming closes all valves, blinks the ARM LED ~45 s (seal now), then drops WiFi and begins the deep-sleep mission. No remote control once armed.</div>
-<div class="row"><button class="g arm-btn" onclick="arm()">ARM &amp; DEPLOY</button>
-  <button class="gr arm-btn" onclick="clearMission()">Clear / Disarm</button></div>
-<div id="arm-status"></div>
+<hr class="sep"><h2>Mission</h2>
+<div class="warn">The unit self-arms on power-up and runs on deep sleep. This page is only reachable during a service window; it closes automatically and the schedule continues.</div>
+<div class="row"><button class="r arm-btn" onclick="abortMission()">Abort mission</button>
+  <button class="g arm-btn" onclick="restartMission()">Restart from t=0</button></div>
+<div id="act-status"></div>
 
 <script>
 const CHANNELS=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20];
 const grid=document.getElementById('grid');
 CHANNELS.forEach(ch=>{const m=ch===20;grid.innerHTML+=`
-  <div class="sc${m?' main-ch':''}" id="sc${ch}"><div class="sc-name">${m?'MAIN':'Ch'+ch}</div>
+  <div class="sc${m?' main-ch':''}" id="sc${ch}"><div class="sc-name">${m?'COMMON':'Ch'+ch}</div>
   <div class="sc-pos" id="sp${ch}">--</div><div class="row" style="margin:0">
   <button class="g" onclick="sc(${ch},'open')">O</button>
   <button class="r" onclick="sc(${ch},'close')">C</button>
   <button class="gr" onclick="sc(${ch},'release')">R</button></div></div>`;});
 const tsel=document.getElementById('tm-ch');
 CHANNELS.forEach(ch=>{const o=document.createElement('option');o.value=ch;
-  o.textContent=(ch===20?'MAIN (Ch20)':'Ch'+ch);tsel.appendChild(o);});
+  o.textContent=(ch===20?'COMMON (Ch20)':'Ch'+ch);tsel.appendChild(o);});
 function cmd(a){fetch('/control?action='+a).catch(()=>{});}
 function sc(ch,a){fetch('/servo?ch='+ch+'&action='+a).catch(()=>{});}
 function tch(){return parseInt(document.getElementById('tm-ch').value);}
@@ -491,41 +494,33 @@ function tsc(a){fetch('/servo?ch='+tch()+'&action='+a).catch(()=>{});}
 function tmove(){fetch('/servo?ch='+tch()+'&action=angle&deg='+document.getElementById('tm-degv').value).catch(()=>{});}
 function thold(p){fetch('/servo?ch='+tch()+'&action=hold&pos='+p).catch(()=>{});}
 function toggleTest(){const on=document.getElementById('tm-panel').style.display==='none';fetch('/testmode?on='+(on?1:0)).catch(()=>{});}
-let timingDirty=false;const timingIds=['t_start','t_open','t_h','t_m','t_sec'];
-timingIds.forEach(id=>{document.getElementById(id).addEventListener('input',()=>{timingDirty=true;
-  timingIds.forEach(i=>document.getElementById(i).classList.add('dirty'));
-  document.getElementById('apply-status').textContent='unsaved';document.getElementById('apply-status').style.color='#f0883e';});});
-function applySettings(){const h=parseInt(document.getElementById('t_h').value)||0,m=parseInt(document.getElementById('t_m').value)||0,s=parseInt(document.getElementById('t_sec').value)||0;
-  const interMs=(h*3600+m*60+s)*1000;
-  fetch(`/settings?startup=${document.getElementById('t_start').value}&open=${document.getElementById('t_open').value}&inter=${interMs}`).then(()=>{
-    timingDirty=false;timingIds.forEach(i=>document.getElementById(i).classList.remove('dirty'));
-    document.getElementById('apply-status').textContent='saved ✓';document.getElementById('apply-status').style.color='#3fb950';
-    setTimeout(()=>{document.getElementById('apply-status').textContent='';},2000);
-  }).catch(()=>{document.getElementById('apply-status').textContent='send failed';document.getElementById('apply-status').style.color='#f85149';});}
-function arm(){if(!confirm('Arm and deploy? WiFi drops after the ~45 s LED blink and the mission runs on deep sleep with no remote control. Seal the enclosure during the blink.'))return;
-  fetch('/arm?confirm=1').then(()=>{document.getElementById('arm-status').textContent='ARMED — LED blinking, seal now. WiFi will drop.';
-  document.getElementById('arm-status').style.color='#f0883e';}).catch(()=>{document.getElementById('arm-status').textContent='send failed';});}
-function clearMission(){if(!confirm('Clear mission state (disarm, reset sample index to 0)?'))return;
-  fetch('/clear?confirm=1').then(()=>{document.getElementById('arm-status').textContent='Cleared / disarmed.';
-  document.getElementById('arm-status').style.color='#3fb950';}).catch(()=>{});}
-function msToHMS(ms){const t=Math.floor(ms/1000);return{h:Math.floor(t/3600),m:Math.floor((t%3600)/60),s:t%60};}
+function say(t,c){const e=document.getElementById('act-status');e.textContent=t;e.style.color=c;}
+function abortMission(){if(!confirm('Abort the mission? The schedule stops and the unit stays awake on WiFi for bench work.'))return;
+  fetch('/clear?confirm=1').then(()=>say('Mission aborted — unit is in bench mode.','#f0883e')).catch(()=>say('send failed','#f85149'));}
+function restartMission(){if(!confirm('Restart the mission from t=0? Sample index resets to 0 and the clock restarts now.'))return;
+  fetch('/restart?confirm=1').then(()=>say('Mission restarted from t=0.','#3fb950')).catch(()=>say('send failed','#f85149'));}
+function dur(s){if(s===null||s===undefined||s<0)return '--';
+  const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),x=Math.floor(s%60);
+  return (d?d+'d ':'')+String(h).padStart(2,'0')+'h'+String(m).padStart(2,'0')+'m'+String(x).padStart(2,'0')+'s';}
 function poll(){fetch('/status').then(r=>r.json()).then(d=>{
+  document.getElementById('mini').style.display=d.mini?'block':'none';
   document.getElementById('st').textContent=d.state;
   const idok=!!d.id_ok;const uEl=document.getElementById('unit');
   uEl.textContent=d.unit>0?('Lander '+d.unit+(idok?'':' · CAL NOT COMMITTED')):'NO UNIT ID SET — bench-set before deploy';
   uEl.style.color=(d.unit>0&&idok)?'#8b949e':'#f85149';
   document.getElementById('vb').textContent=(d.vbatt?d.vbatt.toFixed(2):'--')+' V';
-  document.getElementById('vb').style.color=(d.vbatt&&d.vbatt<5.6)?'#f85149':'#f0883e';
-  document.getElementById('pg').textContent=d.armed?('Armed · next sample '+(parseInt(d.idx)+1)+' of '+d.total):(d.complete?'Mission complete · '+d.total+' samples':'Not armed');
+  document.getElementById('vb').style.color=(d.vbatt&&d.vbatt<d.cutoff)?'#f85149':'#f0883e';
+  document.getElementById('pg').textContent=d.complete?('Mission complete · '+d.total+' samples')
+    :(d.armed?('Next sample '+(parseInt(d.evt)+1)+' of '+d.total):'Not armed · bench mode');
+  document.getElementById('win').textContent=(d.window_ms>0)?('Service window closes in '+Math.ceil(d.window_ms/1000)+' s'):'';
+  document.getElementById('k-elapsed').textContent=dur(d.elapsed_s);
+  document.getElementById('k-next').textContent=(d.evt<d.total)?('#'+(d.evt+1)+' · Ch'+d.next_ch+' · t='+dur(d.next_s)):'—';
+  document.getElementById('k-eta').textContent=(d.evt<d.total)?dur(d.next_s-d.elapsed_s):'—';
+  document.getElementById('k-end').textContent=dur(d.end_s);
   const test=!!d.test;document.getElementById('tm-panel').style.display=test?'block':'none';
   const tb=document.getElementById('tm-btn');tb.textContent=test?'Exit Testing Mode':'Enter Testing Mode';tb.className=test?'r':'b';
-  const armBlock=test||!idok;
-  const ab=document.querySelector('.arm-btn.g');if(ab){ab.disabled=armBlock;ab.style.opacity=armBlock?'0.4':'1';ab.style.cursor=armBlock?'not-allowed':'pointer';}
-  if(!timingDirty){if(d.startup_ms!==undefined)document.getElementById('t_start').value=d.startup_ms;
-    if(d.open_ms!==undefined)document.getElementById('t_open').value=d.open_ms;
-    if(d.inter_ms!==undefined){const t=msToHMS(parseInt(d.inter_ms));document.getElementById('t_h').value=t.h;
-      document.getElementById('t_m').value=t.m;document.getElementById('t_sec').value=t.s;}}
-  if(d.close_offset)document.getElementById('offset-note').textContent='Open = calibrated · Close = open +'+d.close_offset+'° toward 180°';
+  if(d.close_offset)document.getElementById('offset-note').textContent=
+    'Sample valves: close = open +'+d.close_offset+'° · COMMON (Ch20): close = '+d.main_close+'° · common rests OPEN';
   CHANNELS.forEach(ch=>{const c=document.getElementById('sc'+ch),p=document.getElementById('sp'+ch),s=d.servoStates[ch];
     c.className='sc'+(ch===20?' main-ch':'')+(s==='open'?' open':s==='close'?' closed':'');
     p.textContent=s==='open'?'OPEN':s==='close'?'CLOSED':'MID';});
@@ -534,29 +529,42 @@ setInterval(poll,750); poll();
 </script></body></html>
 )rawliteral";
 
-// ── Web handlers ──────────────────────────────────────────────────────────────
+// ── Web handlers ─────────────────────────────────────────────────────────────
+uint32_t g_windowEndMs = 0;      // 0 = not in a bounded window
+
 void handleRoot() { server.send(200, "text/html", HTML_PAGE); }
 
 void handleStatus() {
-  const char* stateStr = st.missionComplete ? "COMPLETE"
-                       : testMode            ? "TESTING"
-                       : st.armed            ? "ARMED"
-                       : !g_idOk             ? "NEEDS UNIT ID"
-                       :                       "ARM MODE";
+  const char* stateStr = st.complete ? "COMPLETE"
+                       : testMode    ? "TESTING"
+                       : !g_idOk     ? "NEEDS UNIT ID"
+                       : st.armed    ? "RUNNING"
+                       :               "BENCH";
+  uint32_t elapsed = missionElapsedS();
+  uint32_t winLeft = (g_windowEndMs > millis()) ? (g_windowEndMs - millis()) : 0;
   String json = "{";
-  json += "\"state\":\""     + String(stateStr)              + "\",";
-  json += "\"unit\":"        + String(g_unitId)              + ",";
-  json += "\"id_ok\":"       + String(g_idOk ? 1 : 0)        + ",";
-  json += "\"armed\":"       + String(st.armed ? 1 : 0)      + ",";
-  json += "\"complete\":"    + String(st.missionComplete?1:0) + ",";
-  json += "\"idx\":"         + String(st.nextSampleIdx)      + ",";
-  json += "\"total\":"       + String(SAMPLE_SERVO_COUNT)    + ",";
-  json += "\"startup_ms\":"  + String(STARTUP_DELAY_MS)      + ",";
-  json += "\"open_ms\":"     + String(SERVO_OPEN_TIME_MS)    + ",";
-  json += "\"inter_ms\":"    + String(INTER_SAMPLE_DELAY_MS) + ",";
-  json += "\"close_offset\":"+ String(CLOSE_OFFSET_DEG)      + ",";
-  json += "\"test\":"        + String(testMode ? 1 : 0)      + ",";
-  json += "\"vbatt\":"       + String(readBatteryVoltage(),2) + ",";
+  json += "\"state\":\""     + String(stateStr)               + "\",";
+  json += "\"unit\":"        + String(g_unitId)               + ",";
+  json += "\"id_ok\":"       + String(g_idOk ? 1 : 0)         + ",";
+  json += "\"armed\":"       + String(st.armed ? 1 : 0)       + ",";
+  json += "\"complete\":"    + String(st.complete ? 1 : 0)    + ",";
+  json += "\"evt\":"         + String(st.evtIdx)              + ",";
+  json += "\"total\":"       + String(EVENT_COUNT)            + ",";
+  json += "\"elapsed_s\":"   + String(elapsed)                + ",";
+  json += "\"next_s\":"      + String(st.evtIdx < EVENT_COUNT ? eventTimeS(st.evtIdx) : 0) + ",";
+  json += "\"next_ch\":"     + String(st.evtIdx < EVENT_COUNT ? SERVO_CHANNELS[st.evtIdx] : 0) + ",";
+  json += "\"end_s\":"       + String(missionEndS())          + ",";
+  json += "\"window_ms\":"   + String(winLeft)                + ",";
+  json += "\"close_offset\":"+ String(CLOSE_OFFSET_DEG)       + ",";
+  json += "\"main_close\":"  + String(MAIN_CLOSE_DEG)         + ",";
+  json += "\"cutoff\":"      + String(VBATT_CUTOFF_V, 2)      + ",";
+  json += "\"test\":"        + String(testMode ? 1 : 0)       + ",";
+#ifdef MINI_DEPLOY
+  json += "\"mini\":1,";
+#else
+  json += "\"mini\":0,";
+#endif
+  json += "\"vbatt\":"       + String(readBatteryVoltage(), 2) + ",";
   json += "\"servoStates\":[";
   for (int i = 0; i <= 20; i++) {
     json += (servoPositions[i]==POS_OPEN) ? "\"open\"" : (servoPositions[i]==POS_MID) ? "\"mid\"" : "\"close\"";
@@ -569,12 +577,11 @@ void handleStatus() {
 void handleControl() {
   if (!server.hasArg("action")) { server.send(400,"text/plain","Missing action"); return; }
   String a = server.arg("action");
-  // Sequential: one servo powered at a time (drive → settle → release).
-  // Positions are held passively afterwards — that IS the flight behavior.
-  if      (a == "cal_all_open")    { moveAllSequential(openServo); }
-  else if (a == "cal_all_close")   { moveAllSequential(closeServo); }
-  else if (a == "cal_all_mid")     { moveAllSequential(midServo); }
+  if      (a == "cal_all_open")    { moveRangeSequential(0, 20, openServo);  railOff(); }
+  else if (a == "cal_all_close")   { moveRangeSequential(0, 20, closeServo); railOff(); }
+  else if (a == "cal_all_mid")     { moveRangeSequential(0, 20, midServo);   railOff(); }
   else if (a == "cal_all_release") { releaseAll(); railOff(); }
+  else if (a == "rest")            { establishRestingState(); }
   server.send(200, "text/plain", "OK");
 }
 
@@ -590,130 +597,266 @@ void handleServo() {
     if (!testMode) { server.send(409,"text/plain","testing mode is off"); return; }
     if      (a == "angle") { int d = server.hasArg("deg") ? server.arg("deg").toInt() : 90; angleServo(ch,(uint8_t)constrain(d,0,180)); }
     else if (a == "sweep") { sweepServo(ch); }
-    else                   { if (server.arg("pos")=="open") openServo(ch); else closeServo(ch); delay(SERVO_SETTLE_MS); releaseServo(ch); }
+    else                   { if (server.arg("pos")=="open") openServo(ch); else closeServo(ch); delay(STEP_SETTLE_MS); releaseServo(ch); }
   }
   server.send(200,"text/plain","OK");
 }
 
-void handleSettings() {
-  long startupMs = server.hasArg("startup") ? server.arg("startup").toInt() : (long)STARTUP_DELAY_MS;
-  long openMs    = server.hasArg("open")    ? server.arg("open").toInt()    : (long)SERVO_OPEN_TIME_MS;
-  long interMs   = server.hasArg("inter")   ? server.arg("inter").toInt()   : (long)INTER_SAMPLE_DELAY_MS;
-  // Guard rails: an empty form field parses to 0, and a 0 ms interval arms a
-  // mission that wakes continuously until the battery is flat.
-  if (startupMs < 0 || openMs < 100 || interMs < 1000) {
-    server.send(400, "text/plain", "rejected: startup>=0, open>=100ms, inter>=1s");
-    return;
-  }
-  STARTUP_DELAY_MS      = (uint32_t)startupMs;
-  SERVO_OPEN_TIME_MS    = (uint32_t)openMs;
-  INTER_SAMPLE_DELAY_MS = (uint32_t)interMs;
-  Serial.printf("[WEB]   timing startup:%lu open:%lu inter:%lu ms\n",
-                STARTUP_DELAY_MS, SERVO_OPEN_TIME_MS, INTER_SAMPLE_DELAY_MS);
-  server.send(200,"text/plain","OK");
+// Abort: stop the schedule and stay awake on the AP for bench work.
+// Clears `complete` too, so a finished unit can be taken back to bench state
+// without erasing NVS (which would also wipe the unit ID).
+void handleClear() {
+  if (server.arg("confirm") != "1") { server.send(400,"text/plain","confirm=1 required"); return; }
+  st.armed = false; st.complete = false; st.evtIdx = 0;
+  saveState(missionElapsedS());
+  g_windowBreak = true; g_operatorAborted = true;
+  Serial.println("[MISSION] aborted by operator — entering bench mode");
+  server.send(200,"text/plain","ABORTED");
 }
 
-void handleArm() {
-  if (testMode) { server.send(409,"text/plain","exit testing mode before arming"); return; }
+// Restart from t=0. Also the way to re-run a unit whose mission has completed,
+// without a flash erase.
+void handleRestart() {
+  if (server.arg("confirm") != "1") { server.send(400,"text/plain","confirm=1 required"); return; }
   if (!g_idOk) {
     server.send(409, "text/plain",
       g_unitId == 0 ? "no unit ID set — run `setid <n>` on the calibrate build first"
                     : "calibration for this unit is not committed (placeholder row)");
     return;
   }
-  if (server.arg("confirm") != "1") { server.send(400,"text/plain","confirm=1 required"); return; }
-  st.armed = true; st.nextSampleIdx = 0; st.phase = PHASE_WARMUP; st.missionComplete = false;
-  st.startupMs = STARTUP_DELAY_MS; st.openMs = SERVO_OPEN_TIME_MS; st.interMs = INTER_SAMPLE_DELAY_MS;
-  saveState();
-  armPending = true; armStartMs = millis();
-  Serial.println("[ARM]   armed; blinking LED then deep sleep");
-  server.send(200,"text/plain","ARMED");
-}
-
-void handleClear() {
-  if (server.arg("confirm") != "1") { server.send(400,"text/plain","confirm=1 required"); return; }
-  st.armed = false; st.nextSampleIdx = 0; st.phase = PHASE_WARMUP; st.missionComplete = false;
-  saveState();
-  armPending = false; digitalWrite(ARM_LED_PIN, LOW);
-  Serial.println("[ARM]   mission cleared / disarmed");
-  server.send(200,"text/plain","CLEARED");
+  st.armed = true; st.complete = false; st.evtIdx = 0;
+  setMissionElapsed(0);                        // t = 0 is now
+  saveState(0);
+  g_benchMode = false; g_operatorAborted = false;
+  g_windowBreak = true;
+  Serial.println("[MISSION] restarted from t=0 by operator");
+  server.send(200,"text/plain","RESTARTED");
 }
 
 void handleTestMode() {
-  if (armPending) { server.send(409,"text/plain","arming in progress"); return; }
   bool on = (server.arg("on") == "1");
   testMode = on;
-  if (!on) { releaseAll(); railOff(); }
-  Serial.printf("[TEST]  testing mode %s\n", on ? "ON" : "OFF");
+  if (on) {
+    // Testing mode and a running schedule must not share the servo rail.
+    st.armed = false;
+    saveState(missionElapsedS());
+    g_windowBreak = true; g_operatorAborted = true;
+    Serial.println("[TEST]  testing mode ON — mission disarmed, bench mode");
+  } else {
+    releaseAll(); railOff();
+    Serial.println("[TEST]  testing mode OFF");
+  }
   server.send(200,"text/plain", on ? "TEST_ON" : "TEST_OFF");
 }
 
 void handleNotFound() { server.send(404,"text/plain","Not found"); }
 
-// ── ARM MODE ──────────────────────────────────────────────────────────────────
-void startArmMode() {
+void startWebServer() {
+  static bool registered = false;
+  if (!registered) {
+    server.on("/",         handleRoot);
+    server.on("/status",   handleStatus);
+    server.on("/control",  handleControl);
+    server.on("/servo",    handleServo);
+    server.on("/testmode", handleTestMode);
+    server.on("/clear",    handleClear);
+    server.on("/restart",  handleRestart);
+    server.onNotFound(handleNotFound);
+    registered = true;
+  }
+  server.begin();
+}
+
+// Bounded service window. Returns true if an operator action ended it early
+// (abort, restart, or testing mode) — the caller then re-reads st to see which.
+// ledConfirmMs > 0 blinks LED1 for that long at the start: the Rev K
+// "the U10 latch caught, safe to deploy" confirmation.
+bool runServiceWindow(uint32_t windowMs, uint32_t ledConfirmMs) {
+  g_windowBreak = false;
+  WiFi.softAP(apSsid, AP_PASSWORD);
+  startWebServer();
+  Serial.printf("[AP]    %s  http://%s  (window %lu s)\n",
+                apSsid, WiFi.softAPIP().toString().c_str(), (unsigned long)(windowMs / 1000));
+  uint32_t t0 = millis();
+  g_windowEndMs = t0 + windowMs;
+  while ((millis() - t0) < windowMs) {
+    server.handleClient();
+    if (ledConfirmMs && (millis() - t0) < ledConfirmMs) digitalWrite(ARM_LED_PIN, (millis() / 250) % 2);
+    else                                                digitalWrite(ARM_LED_PIN, LOW);
+    if (g_windowBreak) {
+      g_windowEndMs = 0; g_windowBreak = false;
+      digitalWrite(ARM_LED_PIN, LOW);
+      Serial.println("[AP]    window ended early — operator action");
+      return true;
+    }
+    delay(2);
+  }
+  g_windowEndMs = 0;
+  digitalWrite(ARM_LED_PIN, LOW);
+  radiosOff();
+  Serial.println("[AP]    service window closed — radio off");
+  return false;
+}
+
+// ── Mission wake ─────────────────────────────────────────────────────────────
+void runMissionWake(bool freshBoot, bool unexpectedReset) {
   buildPulseTables();
   initBatteryAdc();
   initServoDrivers();
-  parkAllClosed();
-  railOff();                 // idle bench state: parked, passive hold, rail off
-  WiFi.softAP(apSsid, AP_PASSWORD);
-  Serial.printf("[AP]    %s  http://%s\n", apSsid, WiFi.softAPIP().toString().c_str());
-  server.on("/",         handleRoot);
-  server.on("/status",   handleStatus);
-  server.on("/control",  handleControl);
-  server.on("/servo",    handleServo);
-  server.on("/testmode", handleTestMode);
-  server.on("/settings", handleSettings);
-  server.on("/arm",      handleArm);
-  server.on("/clear",    handleClear);
-  server.onNotFound(handleNotFound);
-  server.begin();
-  Serial.println("[AP]    ready — calibrate, set timing, then ARM");
+  // Rail stays OFF until the first driveServo() — the battery read below runs
+  // at sleep-level draw, and a low battery never actuates.
+  float vb = readBatteryVoltage();
+  Serial.printf("[WAKE]  elapsed=%lu s  next=%u/%u  Vbatt=%.2f V%s\n",
+                (unsigned long)missionElapsedS(), st.evtIdx + 1, EVENT_COUNT, vb,
+                unexpectedReset ? "  (UNEXPECTED RESET — resuming)" : "");
+
+  if (freshBoot) {
+    // Confirm the latch caught, and let an operator intervene, BEFORE anything moves.
+    if (runServiceWindow(AP_BOOT_WINDOW_MS, LED_CONFIRM_MS) && !st.armed) { g_benchMode = true; return; }
+    establishRestingState();
+  } else if (unexpectedReset) {
+    if (runServiceWindow(AP_BOOT_WINDOW_MS, 0) && !st.armed) { g_benchMode = true; return; }
+  }
+
+  bool low = batteryTooLow(vb);
+  if (low) Serial.printf("[WAKE]  LOW BATTERY %.2f V < %.2f V — no actuation this wake\n", vb, VBATT_CUTOFF_V);
+
+  // Run everything that is due. Normally 0 or 1; more only after an outage.
+  bool ranEvent = false;
+  while (st.evtIdx < EVENT_COUNT && missionElapsedS() >= eventTimeS(st.evtIdx)) {
+    if (low) {
+      Serial.printf("[WAKE]  SKIPPED sample %u/%u (Ch%u) — low battery\n",
+                    st.evtIdx + 1, EVENT_COUNT, SERVO_CHANNELS[st.evtIdx]);
+    } else {
+      runSampleEvent(st.evtIdx);
+      ranEvent = true;
+    }
+    st.evtIdx++;
+    saveState(missionElapsedS());
+  }
+
+  if (st.evtIdx >= EVENT_COUNT) endMission();          // never returns on battery
+
+  if (ranEvent) {
+    if (runServiceWindow(AP_WINDOW_MS, 0) && !st.armed) { g_benchMode = true; return; }
+  }
+
+  // Sleep to the next event, capped by the heartbeat so battery gets logged
+  // through the long gaps (up to 59h55m) instead of once every event.
+  uint32_t now    = missionElapsedS();
+  uint32_t target = eventTimeS(st.evtIdx);
+  uint32_t sleepS = (target > now) ? (target - now) : 1;
+  if (sleepS > HEARTBEAT_S) {
+    sleepS = HEARTBEAT_S;
+    Serial.printf("[WAKE]  heartbeat sleep (%lu s to event %u)\n",
+                  (unsigned long)(target - now), st.evtIdx + 1);
+  }
+  enterDeepSleepS(sleepS);
 }
 
-// ── Setup / Loop ──────────────────────────────────────────────────────────────
+// ── Setup / Loop ─────────────────────────────────────────────────────────────
 void setup() {
   initPowerPins();            // FIRST: SHUTDOWN low (stay alive), servo rail OFF
   Serial.begin(115200); delay(300);
 #ifdef MINI_DEPLOY
-  Serial.println("###### MINI-DEPLOY TEST BUILD — short timings, -TEST SSID, DO NOT SEAL ######");
+  Serial.println("###### MINI-DEPLOY TEST BUILD — compressed schedule, -TEST SSID, DO NOT SEAL ######");
 #endif
   memset(servoHasPWM, false, sizeof(servoHasPWM));
   pinMode(ARM_LED_PIN, OUTPUT); digitalWrite(ARM_LED_PIN, LOW);
 
   loadState();
-  loadUnitId();               // select this unit's calibration row + SSID
-  esp_reset_reason_t       rr = esp_reset_reason();
-  esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
-  Serial.printf("=== BOOT reset=%d wake=%d armed=%d done=%d idx=%u ===\n",
-                rr, wc, st.armed, st.missionComplete, st.nextSampleIdx);
+  loadUnitId();
+  g_resetReason = esp_reset_reason();
 
-  bool selfWoke = (rr == ESP_RST_DEEPSLEEP);
-  bool brownout = (rr == ESP_RST_BROWNOUT);
+  bool freshBoot       = (g_resetReason == ESP_RST_POWERON);
+  bool wokeFromSleep   = (g_resetReason == ESP_RST_DEEPSLEEP);
+  bool unexpectedReset = !freshBoot && !wokeFromSleep;
 
-  if (st.armed && !st.missionComplete && (selfWoke || brownout)) {
-    runMissionWake(wc);          // never returns
-    return;                      // insurance: never fall through to WiFi mid-mission
+  // ---- Rebuild the mission clock ----
+  // RTC memory survives deep sleep and software resets; it does NOT survive a
+  // power-on. NVS survives everything. On a power-on we cannot know how long
+  // we were dead, so we resume at the last persisted elapsed value: no event
+  // is repeated or skipped, but the schedule shifts by the outage. Logged.
+  if (freshBoot) {
+    if (st.armed && st.evtIdx > 0) {
+      setMissionElapsed(st.elapsedS);
+      Serial.printf("[CLOCK] POWER-ON mid-mission — clock lost. Resuming at elapsed=%lu s, "
+                    "event %u/%u. SCHEDULE HAS SLIPPED by the outage.\n",
+                    (unsigned long)st.elapsedS, st.evtIdx + 1, EVENT_COUNT);
+    } else {
+      setMissionElapsed(0);                    // t = 0 is now
+    }
+  } else if (rtcMagic == STATE_MAGIC) {
+    setMissionElapsed(rtcElapsedS);
+    if (rtcEvtIdx != st.evtIdx)
+      Serial.printf("[CLOCK] RTC evt %u != NVS evt %u — trusting NVS\n", rtcEvtIdx, st.evtIdx);
+  } else {
+    setMissionElapsed(st.elapsedS);            // RTC gone; fall back to NVS
+    Serial.println("[CLOCK] RTC memory invalid — falling back to NVS elapsed");
   }
-  if (st.missionComplete && (selfWoke || brownout)) {
-    Serial.println("[BOOT]  mission complete — park + quiet sleep");
-    buildPulseTables(); initServoDrivers(); parkAllClosed();
-    enterDeepSleepForever();
+
+  Serial.printf("=== BOOT reset=%d elapsed=%lu s armed=%d done=%d evt=%u/%u ===\n",
+                (int)g_resetReason, (unsigned long)g_elapsedAtWake,
+                st.armed, st.complete, st.evtIdx, EVENT_COUNT);
+
+  // A completed mission must still be reachable. NVS survives a reflash, so a
+  // unit that finished a rehearsal would otherwise latch off instantly on every
+  // subsequent boot — looking bricked, and recoverable only by erasing NVS,
+  // which would also wipe the unit ID. Give the operator a window to Restart.
+  if (st.complete) {
+    Serial.println("[BOOT]  mission COMPLETE — service window before shutdown (Restart to re-run)");
+    buildPulseTables(); initBatteryAdc(); initServoDrivers();
+    runServiceWindow(AP_BOOT_WINDOW_MS, LED_CONFIRM_MS);
+    if (st.complete) { endMission(); return; }        // nobody intervened
+    Serial.println("[BOOT]  operator cleared the completed state");
   }
 
-  startArmMode();                // fresh power-on / EN reset → bench + pre-seal arming
+  // Self-arm on a fresh power-on: t=0 is now. No operator step in the flight
+  // path. Skipped if the operator explicitly aborted during a window this boot.
+  if (freshBoot && !st.armed && !g_operatorAborted) {
+    if (g_idOk) {
+      st.armed = true; st.evtIdx = 0;
+      saveState(0);
+      Serial.printf("[MISSION] self-armed at t=0 — %u samples, mission length %lu s\n",
+                    EVENT_COUNT, (unsigned long)missionEndS());
+    } else {
+      Serial.println("[MISSION] NOT ARMED — unit ID unset or calibration not committed");
+    }
+  }
+
+  if (st.armed) {
+    runMissionWake(freshBoot, unexpectedReset);
+    if (!g_benchMode) return;                  // runMissionWake deep-slept
+  }
+
+  // Bench mode: unarmable, or the operator aborted. AP stays up, but bounded —
+  // a latched unit left on deck must not drain the pack unnoticed.
+  g_benchMode = true;
+  buildPulseTables(); initBatteryAdc(); initServoDrivers();
+  WiFi.softAP(apSsid, AP_PASSWORD);
+  startWebServer();
+  g_benchStartMs = millis();
+  Serial.printf("[BENCH] %s  http://%s  (idle limit %lu min)\n",
+                apSsid, WiFi.softAPIP().toString().c_str(), (unsigned long)(BENCH_IDLE_MS / 60000));
 }
 
 void loop() {
+  if (!g_benchMode) return;
   server.handleClient();
-  if (armPending) {
-    digitalWrite(ARM_LED_PIN, (millis() / 250) % 2);
-    if (millis() - armStartMs >= ARM_BLINK_MS) {
-      armPending = false;
-      Serial.println("[ARM]   seal window done → park + begin mission");
-      parkAllClosed();
-      enterDeepSleep((uint64_t)STARTUP_DELAY_MS * 1000ULL);
-    }
+  if (!st.armed && (millis() - g_benchStartMs) > BENCH_IDLE_MS) {
+    Serial.println("[BENCH] idle limit reached — sleeping to protect the pack (reset to wake)");
+    releaseAll(); railOff(); sleepServoDrivers(); radiosOff();
+    Serial.flush();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    esp_deep_sleep_start();
+  }
+  // A /restart during bench mode re-arms; pick the schedule back up. If the
+  // operator aborts again inside the new service window, runMissionWake sets
+  // g_benchMode and we simply fall back into this loop.
+  if (st.armed) {
+    g_benchMode = false; g_operatorAborted = false;
+    radiosOff();
+    runMissionWake(true, false);               // deep-sleeps unless aborted again
+    g_benchStartMs = millis();
   }
 }

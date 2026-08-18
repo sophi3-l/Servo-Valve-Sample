@@ -1,55 +1,145 @@
 # Calibration
 
-How to find each valve's open/closed angles and where to record them.
+How to find each valve's open/closed angles, stamp a unit ID, and where to record
+the result.
+
+The angles live in [`include/calibration.h`](../include/calibration.h) →
+`CH_OPEN_DEG_ALL[unitID − 1]`. That header is the only copy the flight builds
+read; the tables below are the human record of how those numbers were obtained.
+
+## Unit numbering
+
+The team calls the units **A/B/C/D**; the firmware only knows **1–4**. `setid`,
+NVS, and the SSID all use numbers. Nothing enforces the mapping automatically —
+if a unit is relabelled, update this table, the comment in `calibration.h`, and
+the README together.
+
+| Bench name | Unit ID | SSID | Calibration |
+|---|---|---|---|
+| Lander D | 1 | `LanderController1` | committed (original set) |
+| Lander A | 2 | `LanderController2` | committed 2026-08-18 |
+| Lander B | 3 | `LanderController3` | committed 2026-08-18 |
+| Lander C | 4 | `LanderController4` | committed 2026-08-18; **Ch18–19 pending** servo transplant from D |
 
 ## Procedure
 
-1. Flash the calibration build: `pio run -e calibrate -t upload`, then open the
-   serial monitor at 115200 (newline line ending).
-2. For each channel, type `<ch> <deg>` (e.g. `0 90`). Nudge until the valve is
-   **fully open with no strain** — that angle is the channel's `CH_OPEN_DEG`.
-3. Then type `open + offset` and confirm the valve is **fully closed but not
-   grinding** against its stop. The offset that works must be ≤ 65° for *every*
-   channel, because `CLOSE_OFFSET_DEG` is one shared value.
-4. `r <ch>` releases a channel (cuts PWM) so you can re-clock a horn by hand or
-   watch for creep.
-5. Record the open angles below **and** in
-   [`include/calibration.h`](../include/calibration.h) → `CH_OPEN_DEG[]`.
-   That header is the only copy the flight builds read.
+1. `pio run -e calibrate -t upload`, then open the serial monitor at **115200**
+   (newline line ending).
+2. **Stamp the unit ID:** `setid <n>` — the *number*, not the letter. Confirm with
+   `id`. This persists in NVS across reflashes; only a flash **erase** loses it.
+3. For each channel, type `<ch> <deg>` (e.g. `0 95`). Nudge until the valve is
+   **fully open with no strain** — that angle is the channel's open angle. The
+   CLI refuses anything below `SERVO_MIN_DEG` (70°); the valve linkages bind
+   below that, and commanding into the stop is what stalled Ch20/Ch14 on the bench.
+4. Confirm the closed position:
+   - **Sample valves (Ch0–19):** open + `CLOSE_OFFSET_DEG` (65°) must be fully
+     closed without grinding. 65 is shared by every channel and is already at its
+     ceiling — the highest committed open angle is 115°, and 115 + 65 = 180.
+   - **Common valve (Ch20):** closes to `MAIN_CLOSE_DEG` (175°), *not* open + 65.
+     See the note below.
+5. `r <ch>` releases a channel (cuts PWM) so you can re-clock a horn by hand or
+   watch for creep. `off` releases everything and drops the rail.
+6. `table` prints this unit's full open/close map — the same angles the flight
+   build will actually drive, including Ch20. Use it as the final check.
+7. Paste the 21 open angles into row `n − 1` of `CH_OPEN_DEG_ALL`, set
+   `CAL_COMMITTED[n − 1] = true`, run `python tools/check_calibration.py`, commit.
+
+A unit whose row is still a placeholder (`CAL_COMMITTED` false) **refuses to
+arm**. Bad angles now also fail the *build* via `static_assert`, not just the lint.
+
+### Other calibrate-build commands
+
+| Command | Effect |
+|---|---|
+| `rail` / `off` | Rail ON with zero PWM (Q2 gate-table HIGH row) / release all + rail OFF |
+| `cycle [ms]` | Deliberate rail power-cycle for scope work |
+| `active` | List driven channels and the ≤2 count |
+| `v` | Battery voltage via the GPIO34 divider |
+| `table` | This unit's open/close map |
+| `id` / `setid <n>` | Show / stamp the lander ID |
+
+## The common valve is different
+
+Ch20 does **not** use the offset formula. It closes to `MAIN_CLOSE_DEG`, a single
+named constant, because the main valve needs near-full travel to seal while the
+sample valves do not.
+
+It previously used a hardcoded **180°** — the absolute end of the commanded pulse
+range (`degToPulse(180)` = 512 counts = 2500 µs), i.e. driven into the servo's
+mechanical stop on every close, twice per sample event plus every park. The low
+end had a guard (`SERVO_MIN_DEG`); the high end had none.
+
+**`MAIN_CLOSE_DEG = 175` is a starting value, not a bench-confirmed one.** It must
+be verified per unit during the Rev K Section 14 cold/oil test at ~8 °C: drive the
+common valve to it, cut PWM, and confirm it is *fully sealed* and does not creep.
+Raise it if a unit needs more travel; if the four units disagree, convert it to a
+per-lander row like `CH_OPEN_DEG_ALL`.
+
+Two things make this cushion matter more than it looks:
+
+- The pack is 6 V nominal and the HPS-2018 is rated 6.0–8.4 V, so the servos run
+  at or below their minimum rating for most of the discharge.
+- They are submerged in oil at ~8 °C, which the 0.20 s/60° datasheet figure (7.4 V,
+  no load, in air) does not account for at all.
+
+A servo that cannot finish its stroke inside the 2 s settle ends up both
+under-travelled (no seal) *and* stalled for the whole window, at 1.4–2.3 A against
+the ~0.227 A the two-servo path is certified for.
 
 ## Recorded angles
 
-Mapping in use: 50 Hz, 25 MHz osc, `map(deg, 0,180, 102,512)` → 102 ≈ 500 µs,
-512 ≈ 2500 µs. `CLOSE_OFFSET_DEG` = ___° (≤ 65).
+Mapping: 50 Hz, 25 MHz oscillator, `map(deg, 0,180, 102,512)` → 102 ≈ 500 µs,
+512 ≈ 2500 µs. `CLOSE_OFFSET_DEG` = 65 (sample valves). `MAIN_CLOSE_DEG` = 175 (Ch20).
 
-| Ch | Board | Open ° | Close ° (open+offset) | Notes |
-|----|-------|--------|-----------------------|-------|
-| 0  | 0x40  |        |                       | |
-| 1  | 0x40  |        |                       | |
-| 2  | 0x40  |        |                       | |
-| 3  | 0x40  |        |                       | |
-| 4  | 0x40  |        |                       | |
-| 5  | 0x40  |        |                       | |
-| 6  | 0x40  |        |                       | |
-| 7  | 0x40  |        |                       | |
-| 8  | 0x40  |        |                       | |
-| 9  | 0x40  |        |                       | |
-| 10 | 0x40  |        |                       | |
-| 11 | 0x40  |        |                       | |
-| 12 | 0x40  |        |                       | |
-| 13 | 0x40  |        |                       | |
-| 14 | 0x40  |        |                       | |
-| 15 | 0x40  |        |                       | |
-| 16 | 0x41  |        |                       | local 0 |
-| 17 | 0x41  |        |                       | local 1 |
-| 18 | 0x41  |        |                       | local 2 |
-| 19 | 0x41  |        |                       | local 3 |
-| 20 | 0x41  |        |                       | local 4 · MAIN intake |
+Open angles as committed in `calibration.h`:
+
+| Ch | Board | D (1) | A (2) | B (3) | C (4) | Notes |
+|----|-------|-------|-------|-------|-------|-------|
+| 0  | 0x40 | 100 | 95 | 95 | 95 | |
+| 1  | 0x40 | 110 | 90 | 100 | 100 | |
+| 2  | 0x40 | 100 | 90 | 100 | 105 | |
+| 3  | 0x40 | 95 | 95 | 105 | 100 | |
+| 4  | 0x40 | 95 | 100 | 100 | 95 | |
+| 5  | 0x40 | 105 | 90 | 100 | 100 | |
+| 6  | 0x40 | 95 | 85 | 95 | 95 | |
+| 7  | 0x40 | 110 | 95 | 100 | 100 | |
+| 8  | 0x40 | 95 | 100 | 110 | 95 | |
+| 9  | 0x40 | 105 | 100 | 95 | 90 | |
+| 10 | 0x40 | 100 | 100 | 110 | **115** | C at the 65° offset ceiling |
+| 11 | 0x40 | 105 | 90 | 90 | 105 | |
+| 12 | 0x40 | 95 | 100 | 95 | 105 | |
+| 13 | 0x40 | **115** | 95 | 105 | 105 | D at the 65° offset ceiling |
+| 14 | 0x40 | 110 | 95 | 95 | 100 | |
+| 15 | 0x40 | 95 | 105 | 100 | 100 | |
+| 16 | 0x41 | 100 | 105 | 100 | 100 | local 0 |
+| 17 | 0x41 | 95 | 100 | 100 | 105 | local 1 |
+| 18 | 0x41 | 95 | 95 | 110 | *95* | local 2 · **C placeholder** |
+| 19 | 0x41 | 90 | 95 | 100 | *90* | local 3 · **C placeholder** |
+| 20 | 0x41 | 90 | 105 | 90 | 100 | local 4 · **COMMON** — closes to 175, not open+65 |
+
+Lander C's Ch18–19 values are copies of Lander D's and are **not real bench
+angles** — those ports are unpopulated pending the servo transplant. They exist
+only so the pulse tables never operate on uninitialised values. C will run all 20
+sample events regardless; the firmware is open-loop and cannot tell that two of
+them actuate nothing.
+
+After the transplant, re-verify those two channels on the bench. The angle carries
+the servo's trim and horn position but **not** the valve body's — you are keeping
+two of three variables and changing the third.
 
 ## Passive-hold check (critical)
 
-Using the bench build's Testing Mode → Hold-check: drive a valve open (and
+Using the deploy build's **Testing Mode → Hold-check**: drive a valve open (and
 separately closed), cut PWM, and confirm it does **not** creep over a span far
-longer than the 18 h field interval, ideally under representative load. The
-deep-sleep power budget assumes the gear train self-holds; if a channel creeps,
-it's a mechanical fix, not a firmware one. Record pass/fail per channel here.
+longer than the field interval, under representative load. The deep-sleep power
+budget assumes the gear train self-holds; if a channel creeps, it is a mechanical
+fix, not a firmware one.
+
+For Ch20, "Hold-check · closed" doubles as the `MAIN_CLOSE_DEG` seal test.
+
+Record pass/fail per channel per unit:
+
+| Ch | D (1) | A (2) | B (3) | C (4) |
+|----|-------|-------|-------|-------|
+| 0–19 | | | | |
+| 20 (common) | | | | |
