@@ -46,9 +46,21 @@
 //    hold their positions passively, so a low battery now logs, skips the
 //    event, and sleeps without touching the rail.
 //
-//  • RESTING STATE. Common (Ch20) rests OPEN and is closed only for the 124 s
-//    inside a sample event. Startup parks the 20 SAMPLE valves closed and then
-//    opens common, which is the state every event's step 1 assumes.
+//  • RESTING STATE IS A PRECONDITION, NOT A STARTUP ACTION (Howard, 2026-08-19).
+//    Common (Ch20) rests OPEN, sample valves rest CLOSED, and the mission both
+//    starts and ends in that state. This build NO LONGER establishes it on
+//    power-up. It used to, which meant 21 actuations every single boot — and
+//    since esptool resets the board at the end of an upload, every FLASH was a
+//    boot. A bench day with ten flashes silently cost 210 valve movements
+//    before anyone ran a test. The operator now sets the state deliberately,
+//    once, via the calibrate build's `rest` command as the last step of bench
+//    setup. The guarantee this buys:
+//
+//        NO CODE PATH IN THIS BUILD MOVES A VALVE OUTSIDE A SCHEDULED SAMPLE
+//        EVENT, EXCEPT UNDER OPERATOR CONTROL IN TESTING MODE.
+//
+//    Mass sweeps are gated behind Testing Mode for the same reason. Valve
+//    positions read UNKNOWN after a boot, because they are.
 //
 //  • MISSION END. Each event closes its own sample valve, and the last event
 //    ends with common open — so the desired end state already exists and there
@@ -146,7 +158,13 @@ Adafruit_PWMServoDriver pwm0 = Adafruit_PWMServoDriver(PCA0_ADDR);
 Adafruit_PWMServoDriver pwm1 = Adafruit_PWMServoDriver(PCA1_ADDR);
 WebServer server(80);
 
-enum ServoPos { POS_CLOSE, POS_MID, POS_OPEN };
+// POS_UNKNOWN is the honest startup state. This build no longer moves anything
+// at power-up, so after a boot the firmware genuinely does not know where any
+// valve is — and these servos have no position feedback, so it never will until
+// something is commanded. Showing "CLOSED" for all 21 would be a guess dressed
+// up as knowledge, which is exactly the sort of thing that gets trusted on a
+// deck at 2am. The UI shows "--" until a channel is actually driven.
+enum ServoPos { POS_UNKNOWN, POS_CLOSE, POS_MID, POS_OPEN };
 ServoPos servoPositions[21];
 bool     servoHasPWM[21];
 
@@ -241,7 +259,7 @@ void buildPulseTables() {
   for (uint8_t i = 0; i <= 20; i++) {
     chOpenPulse[i]   = degToPulse(CH_OPEN[i]);
     chClosePulse[i]  = degToPulse(closeDegFor(i, CH_OPEN[i]));   // Ch20 → MAIN_CLOSE_DEG
-    servoPositions[i] = POS_CLOSE;
+    servoPositions[i] = POS_UNKNOWN;   // nothing has been commanded yet
   }
 }
 void initServoDrivers() {
@@ -263,34 +281,43 @@ float readBatteryVoltage() {
 bool batteryTooLow(float vb) { return (vb >= VBATT_PLAUSIBLE_MIN && vb < VBATT_CUTOFF_V); }
 
 // ── Mission-level valve actions ──────────────────────────────────────────────
-// Resting state: 20 sample valves CLOSED, common OPEN. Every sample event's
-// step 1 ("close common") assumes common is open when it starts.
-void establishRestingState() {
+// Resting state (20 sample valves CLOSED, common OPEN) is NOT established here.
+// It is the operator's job, via the calibrate build's `rest` command, as the
+// last step of bench setup. See the RESTING STATE note in the header block.
+// The only remaining route to a mass move in this build is Testing Mode.
+void restingStateSweep() {
   Serial.println("[VALVE] resting state: close 20 sample valves, then open common");
   moveRangeSequential(0, SAMPLE_SERVO_COUNT - 1, closeServo);
   openServo(MAIN_SERVO_CH);
   delay(STEP_SETTLE_MS);
   releaseServo(MAIN_SERVO_CH);
   railOff();
+  Serial.println("[VALVE] VISUALLY CONFIRM: Ch0-19 closed, Ch20 (common) OPEN");
 }
 
-// The protocol's 8-command routine, literal (see schedule.h):
-//   0 close common / 2 release / 4 open sample / 6 release
-//   120 close sample / 122 release / 124 open common / 126 release
+// The protocol's sample routine (see schedule.h). Commands are issued at fixed
+// offsets from the start of the event — 0 / 4 / 120 / 124 s — and each servo is
+// released STEP_SETTLE_MS later. The waits between are computed from those
+// offsets, so changing the settle CANNOT shift a command time: the sample valve
+// is open for 116 s and common is closed for 124 s at any settle value.
 void runSampleEvent(uint8_t idx) {
   uint8_t ch = SERVO_CHANNELS[idx];
-  Serial.printf("[EVENT] sample %u/%u  Ch%u  (t=%lu s)\n",
-                idx + 1, EVENT_COUNT, ch, (unsigned long)missionElapsedS());
+  Serial.printf("[EVENT] sample %u/%u  Ch%u  (t=%lu s, settle %u ms)\n",
+                idx + 1, EVENT_COUNT, ch, (unsigned long)missionElapsedS(), STEP_SETTLE_MS);
 
+  // t = 0 s — close common
   closeServo(MAIN_SERVO_CH); delay(STEP_SETTLE_MS); releaseServo(MAIN_SERVO_CH);
-  delay(STEP_GAP_MS);
+  delay(CMD_OPEN_SAMPLE_MS - CMD_CLOSE_COMMON_MS - STEP_SETTLE_MS);
 
+  // t = 4 s — open sample n
   openServo(ch);             delay(STEP_SETTLE_MS); releaseServo(ch);
-  delay(SAMPLE_DWELL_MS);                            // sample valve open, unpowered
+  delay(CMD_CLOSE_SAMPLE_MS - CMD_OPEN_SAMPLE_MS - STEP_SETTLE_MS);   // open, unpowered
 
+  // t = 120 s — close sample n
   closeServo(ch);            delay(STEP_SETTLE_MS); releaseServo(ch);
-  delay(STEP_GAP_MS);
+  delay(CMD_OPEN_COMMON_MS - CMD_CLOSE_SAMPLE_MS - STEP_SETTLE_MS);
 
+  // t = 124 s — open common, back to resting state
   openServo(MAIN_SERVO_CH);  delay(STEP_SETTLE_MS); releaseServo(MAIN_SERVO_CH);
 
   railOff();
@@ -436,13 +463,10 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 </div>
 
 <h2>Servos</h2><div class="note" id="offset-note"></div><div class="servo-grid" id="grid"></div>
-<div class="row">
-  <button class="g"  onclick="cmd('cal_all_open')">All Open</button>
-  <button class="r"  onclick="cmd('cal_all_close')">All Close</button>
-  <button class="gr" onclick="cmd('cal_all_mid')">All 90°</button>
-  <button class="gr" onclick="cmd('cal_all_release')">Release All</button>
-</div>
-<div class="row"><button class="b" onclick="cmd('rest')">Set resting state (samples closed · common open)</button></div>
+<div class="note">Positions show <b>--</b> until a channel is commanded. This build does not move
+valves on power-up, and these servos have no position feedback, so an uncommanded channel's
+position is genuinely unknown. Sweeps are in Testing Mode.</div>
+<div class="row"><button class="gr" onclick="cmd('cal_all_release')">Release All (cuts PWM, moves nothing)</button></div>
 
 <hr class="sep"><h2>Testing Mode</h2>
 <div class="note">Bench bring-up — one servo at a time. Aborts the mission while on; exit and restart to re-arm.</div>
@@ -466,6 +490,14 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     <button class="gr" onclick="thold('close')">Hold-check · closed</button>
     <button class="gr" onclick="thold('open')">Hold-check · open</button>
   </div>
+  <div class="note" style="margin-top:6px">Sweeps — all 21 channels, one at a time. Each is 21 actuations;
+  the authoritative resting-state command is <b>`rest`</b> on the calibrate build.</div>
+  <div class="row">
+    <button class="g"  onclick="cmd('cal_all_open')">All Open</button>
+    <button class="r"  onclick="cmd('cal_all_close')">All Close</button>
+    <button class="gr" onclick="cmd('cal_all_mid')">All 90°</button>
+  </div>
+  <div class="row"><button class="b" onclick="cmd('rest')">Resting state (Ch0–19 closed · common open)</button></div>
   <div class="warn">Hold-check drives to position, cuts PWM, leaves it limp — watch for creep. This is the passive-hold test the deep-sleep budget depends on. For MAIN (Ch20), hold-check · closed is also the MAIN_CLOSE_DEG seal check.</div>
 </div>
 
@@ -523,7 +555,7 @@ function poll(){fetch('/status').then(r=>r.json()).then(d=>{
     'Sample valves: close = open +'+d.close_offset+'° · COMMON (Ch20): close = '+d.main_close+'° · common rests OPEN';
   CHANNELS.forEach(ch=>{const c=document.getElementById('sc'+ch),p=document.getElementById('sp'+ch),s=d.servoStates[ch];
     c.className='sc'+(ch===20?' main-ch':'')+(s==='open'?' open':s==='close'?' closed':'');
-    p.textContent=s==='open'?'OPEN':s==='close'?'CLOSED':'MID';});
+    p.textContent=s==='open'?'OPEN':s==='close'?'CLOSED':s==='mid'?'MID':'--';});
 }).catch(()=>{});}
 setInterval(poll,750); poll();
 </script></body></html>
@@ -567,21 +599,36 @@ void handleStatus() {
   json += "\"vbatt\":"       + String(readBatteryVoltage(), 2) + ",";
   json += "\"servoStates\":[";
   for (int i = 0; i <= 20; i++) {
-    json += (servoPositions[i]==POS_OPEN) ? "\"open\"" : (servoPositions[i]==POS_MID) ? "\"mid\"" : "\"close\"";
+    json += (servoPositions[i]==POS_OPEN)  ? "\"open\""
+          : (servoPositions[i]==POS_MID)   ? "\"mid\""
+          : (servoPositions[i]==POS_CLOSE) ? "\"close\"" : "\"unknown\"";
     if (i < 20) json += ",";
   }
   json += "]}";
   server.send(200, "application/json", json);
 }
 
+// Mass moves are gated behind Testing Mode. A stray click on a 21-valve sweep
+// during a deck service window is 21 unnecessary actuations, and unnecessary
+// actuation is the thing most likely to wear a valve out before it ever flies.
+// Single-channel controls stay ungated: they are one deliberate actuation, and
+// entering Testing Mode disarms the mission, which is too high a price for
+// nudging one valve during a service window.
+// Release-all is ungated — it only cuts PWM, it never drives anything.
 void handleControl() {
   if (!server.hasArg("action")) { server.send(400,"text/plain","Missing action"); return; }
   String a = server.arg("action");
+  if (a == "cal_all_release") { releaseAll(); railOff(); server.send(200,"text/plain","OK"); return; }
+
+  if (!testMode) {
+    server.send(409, "text/plain",
+      "mass moves require testing mode (this build does not sweep valves outside it)");
+    return;
+  }
   if      (a == "cal_all_open")    { moveRangeSequential(0, 20, openServo);  railOff(); }
   else if (a == "cal_all_close")   { moveRangeSequential(0, 20, closeServo); railOff(); }
   else if (a == "cal_all_mid")     { moveRangeSequential(0, 20, midServo);   railOff(); }
-  else if (a == "cal_all_release") { releaseAll(); railOff(); }
-  else if (a == "rest")            { establishRestingState(); }
+  else if (a == "rest")            { restingStateSweep(); }
   server.send(200, "text/plain", "OK");
 }
 
@@ -711,9 +758,11 @@ void runMissionWake(bool freshBoot, bool unexpectedReset) {
                 unexpectedReset ? "  (UNEXPECTED RESET — resuming)" : "");
 
   if (freshBoot) {
-    // Confirm the latch caught, and let an operator intervene, BEFORE anything moves.
+    // Confirm the latch caught, and let an operator intervene. NOTHING MOVES
+    // HERE — the resting state is a precondition established on the bench via
+    // the calibrate build's `rest`, not something this build asserts on every
+    // power-up. See the RESTING STATE note in the header block.
     if (runServiceWindow(AP_BOOT_WINDOW_MS, LED_CONFIRM_MS) && !st.armed) { g_benchMode = true; return; }
-    establishRestingState();
   } else if (unexpectedReset) {
     if (runServiceWindow(AP_BOOT_WINDOW_MS, 0) && !st.armed) { g_benchMode = true; return; }
   }

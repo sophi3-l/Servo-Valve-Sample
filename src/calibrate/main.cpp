@@ -33,6 +33,8 @@
 //     table         print THIS unit's open/close map: angles + pulses
 //     setid <n>     stamp this board's lander ID (1-4) into NVS
 //     id            show the stamped lander ID
+//     rest          set the mission RESTING STATE: Ch0-19 closed, Ch20 open
+//                   ** LAST STEP OF BENCH SETUP, before flashing the mission **
 //
 //  Procedure: nudge to the OPEN angle (fully open, no strain) → record it.
 //  Then try open+offset (≤65°) → confirm fully closed without grinding.
@@ -53,12 +55,27 @@
 //      Use `20 <MAIN_CLOSE_DEG>` then `r 20` here to drive the main valve to
 //      the candidate close angle and cut PWM, and confirm it seals fully and
 //      does not creep — at ~8 °C in oil, on each unit.
+//
+//  CHANGES 2026-08-19 (resting state moved here — Howard):
+//    • New `rest` command. The mission's resting state (Ch0-19 closed, Ch20
+//      common OPEN) is now established HERE, deliberately, as the last step of
+//      bench setup — not by the flight build on every power-up.
+//      The flight build used to assert it at boot, which cost 21 actuations
+//      per boot, and since esptool resets the board after an upload, every
+//      FLASH was a boot. This build is the right place for it: you are already
+//      here doing setid / jogs / hold-checks, and this build can never arm.
+//    • This file now includes schedule.h so bench sweeps use the same
+//      STEP_SETTLE_MS the mission uses. Side benefit: the schedule's
+//      static_asserts get exercised in a third build environment.
 // ============================================================================
 
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <Preferences.h>
 #include "calibration.h"   // degToPulse(), pins, guard, rail control — shared
+#include "schedule.h"      // STEP_SETTLE_MS / STEP_GAP_MS — identical drive
+                           // timing to the mission, so what you confirm on the
+                           // bench is what the flight build actually does
 
 Adafruit_PWMServoDriver pwm0 = Adafruit_PWMServoDriver(PCA0_ADDR);   // Ch 0–15
 Adafruit_PWMServoDriver pwm1 = Adafruit_PWMServoDriver(PCA1_ADDR);   // Ch 16–31
@@ -98,6 +115,16 @@ void releaseEverything() {
   for (uint8_t c = 0; c <= 31; c++) releaseChannel(c);
 }
 
+// This unit's open-angle row, or nullptr if no valid lander ID is stamped.
+// Callers that DRIVE valves must refuse on nullptr — driving with another
+// unit's angles is how a valve gets over-travelled into its stop.
+const uint8_t* thisUnitRow() {
+  prefs.begin("karen", true);
+  uint8_t id = prefs.getUChar("unitid", 0);
+  prefs.end();
+  return chOpenRow(id);
+}
+
 // ── Battery ADC (same chain as the flight builds — validates the divider) ────
 float readBatteryVoltage() {
   uint32_t acc = 0;
@@ -122,6 +149,8 @@ void printHelp() {
   Serial.println("  table        print this unit's open/close map");
   Serial.println("  setid <n>    stamp this board's lander ID 1-4 into NVS");
   Serial.println("  id           show the stamped lander ID");
+  Serial.println("  rest         RESTING STATE: Ch0-19 closed, Ch20 open");
+  Serial.println("               (last step of bench setup, before flashing the mission)");
   Serial.println("  help         this list");
   Serial.println("Ch 0-15 -> 0x40 ;  Ch 16-31 -> 0x41 (local = ch-16). Ch20 = MAIN.");
   Serial.println();
@@ -190,6 +219,41 @@ void loop() {
     Serial.printf("Rail OFF %ld ms...\n", ms);
     railCycle((uint32_t)ms);
     Serial.println("Rail ON (single edge)");
+    return;
+  }
+
+  // Establish the mission's resting state: Ch0-19 CLOSED, Ch20 (common) OPEN.
+  // One servo powered at a time — drive, settle, release, breather — using the
+  // same STEP_SETTLE_MS the mission uses, so what you confirm here is what the
+  // flight build does. This is the LAST thing you run before flashing the
+  // mission build; that build will not move a valve until its first sample.
+  if (input == "rest") {
+    const uint8_t* row = thisUnitRow();
+    if (!row) {
+      Serial.println("Refused: no lander ID stamped. Run `setid <1-4>` first —");
+      Serial.println("driving with another unit's angles risks over-travelling a valve.");
+      return;
+    }
+    Serial.printf("Resting state: closing Ch0-%u, then opening Ch%u (common). "
+                  "~%lu s, one servo at a time.\n",
+                  SAMPLE_SERVO_COUNT - 1, MAIN_SERVO_CH,
+                  (unsigned long)(((uint32_t)SAMPLE_SERVO_COUNT *
+                                   (STEP_SETTLE_MS + STEP_GAP_MS) + STEP_SETTLE_MS) / 1000));
+    for (uint8_t i = 0; i < SAMPLE_SERVO_COUNT; i++) {
+      uint8_t ch = SERVO_CHANNELS[i];
+      moveChannel(ch, closeDegFor(ch, row[ch]));
+      delay(STEP_SETTLE_MS);
+      releaseChannel(ch);
+      delay(STEP_GAP_MS);
+    }
+    moveChannel(MAIN_SERVO_CH, row[MAIN_SERVO_CH]);   // common OPEN = its open angle
+    delay(STEP_SETTLE_MS);
+    releaseChannel(MAIN_SERVO_CH);
+    railOff();
+    Serial.println();
+    Serial.println("Resting state commanded. These servos have NO position feedback —");
+    Serial.printf("VISUALLY CONFIRM: Ch0-%u closed, Ch%u (common) OPEN, before flashing.\n",
+                  SAMPLE_SERVO_COUNT - 1, MAIN_SERVO_CH);
     return;
   }
 

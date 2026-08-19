@@ -138,7 +138,34 @@ def check_schedule(path, cfg, errors, notes):
         errors.append(f"{path} not found")
         return
 
-    routine = find_int(src, "ROUTINE_S", 126)
+    # ROUTINE_S is derived in the header (CMD_OPEN_COMMON_MS + STEP_SETTLE_MS),
+    # so it is no longer a literal we can grep. Recompute it from the parts.
+    settle = find_int(src, "STEP_SETTLE_MS")
+    offs = [find_int(src, n) for n in ("CMD_CLOSE_COMMON_MS", "CMD_OPEN_SAMPLE_MS",
+                                       "CMD_CLOSE_SAMPLE_MS", "CMD_OPEN_COMMON_MS")]
+    if settle is not None and offs[3] is not None:
+        routine = (offs[3] + settle) // 1000
+    else:
+        routine = find_int(src, "ROUTINE_S", 126)
+
+    # The settle must fit inside every gap between protocol commands, or one
+    # servo would still be powered when the next command is issued. And the two
+    # science-critical windows must not have moved while the settle was tuned.
+    if settle is not None and all(o is not None for o in offs):
+        for a, b in zip(offs, offs[1:]):
+            if b <= a:
+                errors.append(f"per-event command offsets out of order ({a} -> {b} ms)")
+            elif settle >= b - a:
+                errors.append(f"STEP_SETTLE_MS {settle} ms does not fit the {b - a} ms "
+                              f"gap between the commands at {a} and {b} ms")
+        if offs[2] - offs[1] != 116000:
+            errors.append(f"sample-open window is {(offs[2]-offs[1])/1000:g} s, expected 116 s")
+        if offs[3] - offs[0] != 124000:
+            errors.append(f"common-closed window is {(offs[3]-offs[0])/1000:g} s, expected 124 s")
+        notes.append(f"  routine {routine} s · settle {settle} ms · "
+                     f"sample open {(offs[2]-offs[1])//1000} s · "
+                     f"common closed {(offs[3]-offs[0])//1000} s")
+
     body = find_array(src, "SAMPLE_TIME_S", r"[^\]]*")
     if body is None:
         errors.append("could not find SAMPLE_TIME_S[...] = { ... };")

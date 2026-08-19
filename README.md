@@ -97,8 +97,15 @@ A boot proceeds:
    *through* U10, so a blinking LED proves the latch caught. No blink → do not deploy.
 2. **Service window, 5 min.** WiFi AP up. Verify unit, battery, state. Abort here
    if you need to — it is the last chance before anything moves.
-3. **Resting state established:** 20 sample valves closed, then common opened.
-4. **Schedule runs on deep sleep.** First sample at t = 32 h 55 m.
+3. **Schedule runs on deep sleep.** First sample at t = 32 h 55 m.
+
+**Nothing moves at power-up.** The resting state (Ch0–19 closed, common open) is
+a *precondition* the operator sets on the bench with the calibrate build's
+`rest` command — not something the flight build asserts on every boot. It used
+to, which cost 21 actuations per boot, and since esptool resets the board after
+an upload, every flash was a boot. The guarantee that buys: **no code path in
+the flight build moves a valve outside a scheduled sample event, except under
+operator control in Testing Mode.**
 
 Each sleep is computed as `next_event_time − elapsed_now`, so time spent awake
 comes out of the following sleep instead of pushing every later event back. Over
@@ -122,6 +129,9 @@ Other behaviour worth knowing:
 - **Mission end: no final park.** Each event closes its own sample valve and the
   last event leaves common open, which is the intended recovery state. Then
   `latchOff()` cuts the unit's own supply.
+- **Valve positions read `--` until commanded.** With no boot actuation the
+  firmware does not know where anything is, and these open-loop servos give it
+  no way to find out. It says so rather than guessing.
 
 See [`docs/protocol.md`](docs/protocol.md) for the event table and the reasoning.
 
@@ -199,8 +209,8 @@ Library versions are already pinned exactly (`@3.0.3`, not `@^3.0.3`).
 
 ## Running a mini-deploy (lab)
 
-A rehearsal runs the **real** valve routine — 2 s settles, 116 s sample-open,
-126 s per event — with only the waits compressed. It therefore cannot be shorter
+A rehearsal runs the **real** valve routine — 1 s settles, 116 s sample-open,
+125 s per event — with only the waits compressed. It therefore cannot be shorter
 than about 42 minutes, and lands around **55 minutes**.
 
 ### Bench power
@@ -232,14 +242,15 @@ pio run -e calibrate -t upload
 setid 2          # NUMBER, not letter:  D=1  A=2  B=3  C=4
 id               # confirm "Lander ID = 2 ... cal committed"
 table            # confirm Ch20 close shows 175, not 180
+rest             # LAST STEP: Ch0-19 closed, Ch20 open (~61 s), then confirm by eye
 
 pio run -e minideploy -t upload
 ```
 
 Confirm on boot: the `###### MINI-DEPLOY TEST BUILD` banner and
 `ssid=LanderController2-TEST`. Then it runs itself — 8 s LED blink, 60 s boot
-window, resting state, 20 events about 2½ minutes apart, ~55 min total. WiFi is
-optional; serial has everything.
+window, then 20 events about 2½ minutes apart, ~55 min total. **No valve moves
+until the first sample.** WiFi is optional; serial has everything.
 
 **Watch for:** `[EVENT] sample n/20` twenty times, then `[DONE] all 20 samples
 collected`. A `[GUARD]` line means something tried to drive a third servo and was
@@ -247,9 +258,7 @@ refused — that should be unreachable. `[WAKE] LOW BATTERY` means the PSU is in
 the dead band above. `[CLOCK]` means an unexpected reset.
 
 Check that each `[EVENT]`'s reported elapsed time is close to its scheduled time.
-Flight overshoot should be 0 s; a rehearsal may overshoot up to ~80 s because the
-compressed gaps are shorter than the routine plus service window, which
-deliberately exercises the overdue-event path.
+Simulated overshoot is 0 s in flight and ~1 s in a rehearsal.
 
 ### Re-running
 
@@ -317,6 +326,7 @@ Three numbers in this repo are placeholders that look like decisions:
 | `MAIN_CLOSE_DEG = 175` | `calibration.h` | Cold/oil seal check at ~8 °C, per unit — does the common valve fully seal, and does it creep? |
 | `VBATT_CUTOFF_V = 5.60` | `src/deploy/main.cpp` | 8 °C discharge test with the real load (Rev K Section 15 item 2). Must leave enough charge to finish. |
 | Passive hold | all channels | Hold-check per channel, open and closed |
+| `STEP_SETTLE_MS = 1000` | `schedule.h` | Stroke re-timed in oil at ~8 °C. Set from a 0.75 s bench measurement in air at room temperature — flight conditions are all slower. |
 
 Also open: whether the protocol's Tfinal times are hard requirements (the ESP32's
 internal RC oscillator will drift roughly 1% over 18 days — see

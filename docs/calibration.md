@@ -43,6 +43,11 @@ the README together.
    build will actually drive, including Ch20. Use it as the final check.
 7. Paste the 21 open angles into row `n − 1` of `CH_OPEN_DEG_ALL`, set
    `CAL_COMMITTED[n − 1] = true`, run `python tools/check_calibration.py`, commit.
+8. **`rest`** — the last thing you run here. It closes Ch0–19 and opens Ch20,
+   one servo at a time, which is the state the mission both starts and ends in.
+   The flight build will not move a valve until its first sample, so this is the
+   only thing that establishes it. Confirm visually: these servos have no
+   position feedback, so your eyes are the only verification that exists.
 
 A unit whose row is still a placeholder (`CAL_COMMITTED` false) **refuses to
 arm**. Bad angles now also fail the *build* via `static_assert`, not just the lint.
@@ -57,6 +62,7 @@ arm**. Bad angles now also fail the *build* via `static_assert`, not just the li
 | `v` | Battery voltage via the GPIO34 divider |
 | `table` | This unit's open/close map |
 | `id` / `setid <n>` | Show / stamp the lander ID |
+| **`rest`** | **Set the mission resting state: Ch0–19 closed, Ch20 open (~61 s). Run this LAST, before flashing the mission build.** Refuses without a stamped unit ID, since driving with another unit's angles risks over-travelling a valve. |
 
 ## The common valve is different
 

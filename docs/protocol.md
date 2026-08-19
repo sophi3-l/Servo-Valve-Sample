@@ -50,27 +50,74 @@ Two other readings were considered and rejected:
   at the end of T0 inc3 (t = 608,224 s) with no scheduled close until
   t = 824,100 s leaves it open for 60 hours.
 
-## Per-event routine — 126 s, literal
+## Per-event routine
 
-```
-    0 s   close common          <- common is OPEN at rest
-    2 s   release common        (settle: PWM off, passive hold)
-    4 s   open sample n         (breather between release and next command)
-    6 s   release sample n
-  120 s   close sample n        <- sample valve open 4 s -> 120 s = 116 s
-  122 s   release sample n
-  124 s   open common           <- back to resting state
-  126 s   release common
-```
+The protocol fixes **when each command is issued**. It does not fix how long the
+servo stays powered afterwards. The firmware keeps those separate, so the release
+time can be tuned for valve wear without shifting the sampling schedule by a
+single second.
 
-Two distinct 2 s intervals, equal in value but not the same quantity:
+| Command offset (fixed by protocol) | Action | Released at |
+|---|---|---|
+| 0 s | close common | 0 s + settle |
+| 4 s | open sample *n* | 4 s + settle |
+| 120 s | close sample *n* | 120 s + settle |
+| 124 s | open common | 124 s + settle |
 
-- **command → release** (`STEP_SETTLE_MS`) — the servo must finish its stroke
-  before PWM is cut. This is also the stall exposure window if a valve binds.
-- **release → next command** (`STEP_GAP_MS`) — a breather that keeps consecutive
-  inrush events off the ~600 µF C1 bank.
+The two windows the science depends on are constant at any settle value:
+**sample valve open 116 s**, **common closed 124 s**. Both are `static_assert`ed
+and checked by the lint, so tuning the settle cannot silently move them.
 
-Total servo drive across the whole mission: 20 events × 4 commands × 2 s = **160 s**.
+### Release time (`STEP_SETTLE_MS`) — the valve-burnout budget
+
+**1000 ms**, set 2026-08-19 (Howard). Basis: a pinch-close timed at ~0.75 s on
+the bench, so about 33% headroom.
+
+The distinction that matters: a servo that has *reached* its commanded position
+is not stalling — it holds at near-idle. A servo that *cannot* reach position
+(mechanical bind, or commanded into a stop) draws stall current — 1.4–2.3 A per
+Hiwonder, against the ~0.227 A the two-servo path is certified for — for exactly
+this long. So this constant only matters in the fault case, where it is the
+entire exposure.
+
+> **The 0.75 s measurement was at room temperature, in air, on a bench supply.**
+> Flight is ~8 °C, submerged in oil, on a 6 V pack that sits at or below the
+> HPS-2018's 6.0 V minimum rating for most of its discharge. All three make the
+> stroke slower, and 33% is not much to give away. A stroke that overruns the
+> window leaves the valve under-travelled (no seal) **and** stalled for the whole
+> window — both failure modes at once.
+>
+> **Re-measure in oil at temperature before flight.** Watching the bench supply's
+> current readout during a single command is enough: current rises through the
+> stroke and drops when the servo arrives. Raising it costs one constant.
+
+Routine length is `124 s + settle` = **125 s** at the current value.
+Total servo drive across the mission: 20 events × 4 commands × 1 s = **80 s**.
+
+## Resting state is a precondition, not a startup action
+
+Sample valves rest **closed**, common rests **open**. The mission both starts and
+ends in that state — the last commanded action of the final event is "open
+common," so no cleanup pass is needed.
+
+The flight build does **not** establish it. It used to, at every power-up, which
+cost 21 actuations per boot — and because esptool resets the board when an upload
+finishes, every *flash* was a boot. A bench day with ten flashes silently spent
+210 valve movements before anyone ran a test.
+
+The operator now sets it deliberately, once, with the calibrate build's `rest`
+command as the last step of bench setup (~61 s). What that buys:
+
+> **No code path in the flight build moves a valve outside a scheduled sample
+> event, except under operator control in Testing Mode.**
+
+Mass sweeps in the deploy web UI are gated behind Testing Mode for the same
+reason. Single-channel controls are not, because entering Testing Mode disarms
+the mission — too high a price for nudging one valve during a service window.
+
+Because nothing moves at power-up, the firmware genuinely does not know where any
+valve is after a boot, and these open-loop servos give it no way to find out. The
+UI shows `--` rather than asserting "CLOSED" for all 21.
 
 ## Event table
 

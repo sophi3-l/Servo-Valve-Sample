@@ -35,32 +35,67 @@
 //  sample event. Do not add those 12 events to the table below.
 //
 //  ---------------------------------------------------------------------------
-//  PER-EVENT ROUTINE (protocol, literal — 8 commands, 126 s)
+//  PER-EVENT ROUTINE
 //  ---------------------------------------------------------------------------
-//     0 s   close common          <- common is OPEN at rest; this closes it
-//     2 s   release common        (settle, then PWM off -> passive hold)
-//     4 s   open sample n         (2 s breather between release and next cmd)
-//     6 s   release sample n
-//   120 s   close sample n        <- sample valve open 4 s -> 120 s = 116 s
-//   122 s   release sample n
-//   124 s   open common           <- back to resting state
-//   126 s   release common
+//  The protocol fixes WHEN each command is issued. It does NOT fix how long the
+//  servo stays powered afterwards — that is a separate, independently tunable
+//  quantity. Keeping the two apart means the release time can be changed for
+//  valve-wear reasons WITHOUT shifting the sampling schedule by a single second.
 //
-//  Note the two distinct 2 s intervals: command->release (settle, the servo
-//  must finish its stroke before PWM is cut) and release->next command (a
-//  breather that avoids back-to-back inrush into the C1 bank). They are equal
-//  here but they are NOT the same quantity; keep them separately named.
+//    COMMAND OFFSET (fixed by protocol)    RELEASE (= command + STEP_SETTLE_MS)
+//        0 s   close common                    0 s + settle
+//        4 s   open sample n                   4 s + settle
+//      120 s   close sample n                120 s + settle
+//      124 s   open common                   124 s + settle
+//
+//  The sample valve is open from 4 s to 120 s = 116 s, and common is closed
+//  from 0 s to 124 s, whatever the settle is. Those are the numbers the science
+//  depends on, and they are structurally protected from the wear tuning.
 // =============================================================================
 
-// ---- Per-event routine timing ----------------------------------------------
-constexpr uint16_t STEP_SETTLE_MS   = 2000;    // command -> release
-constexpr uint16_t STEP_GAP_MS      = 2000;    // release -> next command
-constexpr uint32_t SAMPLE_OPEN_MS   = 116000;  // open cmd -> close cmd
-constexpr uint32_t ROUTINE_MS       = 126000;  // full 8-command routine
-constexpr uint32_t ROUTINE_S        = 126;
+// ---- Command offsets within an event (protocol — do not change) -------------
+constexpr uint32_t CMD_CLOSE_COMMON_MS = 0;
+constexpr uint32_t CMD_OPEN_SAMPLE_MS  = 4000;
+constexpr uint32_t CMD_CLOSE_SAMPLE_MS = 120000;
+constexpr uint32_t CMD_OPEN_COMMON_MS  = 124000;
 
-// Dwell after "release sample" before "close sample": 6 s -> 120 s.
-constexpr uint32_t SAMPLE_DWELL_MS  = SAMPLE_OPEN_MS - STEP_SETTLE_MS;   // 114 s
+// ---- How long a servo stays powered after a command -------------------------
+//  THIS IS THE VALVE-BURNOUT BUDGET, and it is the only thing that controls it.
+//
+//  A servo that has REACHED its commanded position is not stalling — it holds
+//  at near-idle. A servo that CANNOT reach position (mechanical bind, or
+//  commanded into a stop) draws stall current — 1.4-2.3 A per Hiwonder, versus
+//  the ~0.227 A the 2-servo path is certified for — for exactly this long.
+//  Shorter = less damage in a fault. Longer = more certainty the valve seated.
+//
+//  1000 ms, set 2026-08-19 (Howard). Basis: a pinch-close was timed at ~0.75 s
+//  on the bench, giving ~33% headroom.
+//
+//  *** THAT MEASUREMENT WAS AT ROOM TEMPERATURE, IN AIR, ON A BENCH SUPPLY. ***
+//  Flight is ~8 degC, submerged in oil, on a 6 V pack that sits at or below the
+//  HPS-2018's 6.0 V minimum rating for most of its discharge. All three make
+//  the stroke SLOWER, and 33% is not a lot of margin to give away. A stroke
+//  that overruns this window leaves the valve under-travelled (no seal) AND
+//  stalled for the whole window — both failure modes at once.
+//
+//  RE-MEASURE IN OIL AT TEMPERATURE BEFORE FLIGHT. Watching the bench supply's
+//  current readout during a single command is enough: current rises through the
+//  stroke and drops when the servo arrives. Raising this costs one constant and
+//  shifts no schedule.
+constexpr uint16_t STEP_SETTLE_MS = 1000;
+
+// Breather between servos in a SEQUENTIAL SWEEP (the calibrate build's `rest`,
+// the deploy build's manual all-open / all-close). NOT part of the protocol —
+// it exists to keep consecutive inrush events off the ~600 uF C1 bank.
+constexpr uint16_t STEP_GAP_MS = 2000;
+
+// ---- Derived ----------------------------------------------------------------
+constexpr uint32_t SAMPLE_OPEN_MS  = CMD_CLOSE_SAMPLE_MS - CMD_OPEN_SAMPLE_MS;  // 116 s
+constexpr uint32_t ROUTINE_MS      = CMD_OPEN_COMMON_MS + STEP_SETTLE_MS;       // last release
+constexpr uint32_t ROUTINE_S       = ROUTINE_MS / 1000;
+
+// Unpowered dwell between "release sample" and "close sample".
+constexpr uint32_t SAMPLE_DWELL_MS = SAMPLE_OPEN_MS - STEP_SETTLE_MS;
 
 // ---- Absolute sample schedule (Sheet 1, seconds since power-on) -------------
 //  Event i drives SERVO_CHANNELS[i]; there are exactly SAMPLE_SERVO_COUNT of
@@ -167,9 +202,22 @@ static_assert(EVENT_COUNT == SAMPLE_SERVO_COUNT,
               "schedule.h: one event per sample valve — event index IS the sample index.");
 static_assert(SAMPLE_OPEN_MS > STEP_SETTLE_MS,
               "schedule.h: sample-open must exceed the settle, or the dwell underflows.");
-//  4 commands x settle, + 2 inter-command gaps (after release-common at 2 s and
-//  after release-sample at 122 s), + the 114 s dwell = 8 + 4 + 114 = 126 s.
-static_assert(ROUTINE_MS == 4UL * STEP_SETTLE_MS + 2UL * STEP_GAP_MS + SAMPLE_DWELL_MS,
-              "schedule.h: ROUTINE_MS disagrees with the 8-command step timing.");
+// Command offsets must be strictly increasing.
+static_assert(CMD_CLOSE_COMMON_MS < CMD_OPEN_SAMPLE_MS &&
+              CMD_OPEN_SAMPLE_MS  < CMD_CLOSE_SAMPLE_MS &&
+              CMD_CLOSE_SAMPLE_MS < CMD_OPEN_COMMON_MS,
+              "schedule.h: per-event command offsets are out of order.");
+// The settle must fit inside every inter-command interval, or one command's
+// powered window would still be open when the next command is issued — which
+// would put two servos under power and trip the <=2 guard in odd ways.
+static_assert(STEP_SETTLE_MS < (CMD_OPEN_SAMPLE_MS  - CMD_CLOSE_COMMON_MS) &&
+              STEP_SETTLE_MS < (CMD_CLOSE_SAMPLE_MS - CMD_OPEN_SAMPLE_MS)  &&
+              STEP_SETTLE_MS < (CMD_OPEN_COMMON_MS  - CMD_CLOSE_SAMPLE_MS),
+              "schedule.h: STEP_SETTLE_MS is longer than the gap to the next command.");
+// The science-critical durations must not move when the settle is tuned.
+static_assert(SAMPLE_OPEN_MS == 116000UL,
+              "schedule.h: sample-open duration is no longer 116 s.");
+static_assert(CMD_OPEN_COMMON_MS - CMD_CLOSE_COMMON_MS == 124000UL,
+              "schedule.h: common-closed duration is no longer 124 s.");
 static_assert(ROUTINE_S * 1000UL == ROUTINE_MS,
-              "schedule.h: ROUTINE_S and ROUTINE_MS disagree.");
+              "schedule.h: ROUTINE_MS must be a whole number of seconds.");
