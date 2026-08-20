@@ -1,80 +1,40 @@
 // ============================================================================
 //  Karen Valve Controller — FLIGHT / DEPLOY BUILD       (src/deploy/main.cpp)
-//  ESP32 DevKitC-32UE · 2× PCA9685 (0x40 / 0x41) · 21 Hiwonder HPS-2018 valves
-//  (common/main intake = Ch20 · sample valves = Ch0–19)
+//  ESP32 DevKitC-32UE · 2x PCA9685 (0x40 / 0x41) · 21 HPS-2018 valves
+//  common/main intake = Ch20 · sample valves = Ch0-19
 //
-//  Electrical truth  -> include/calibration.h  (pins, angles, rail, guard)
-//  Mission timing    -> include/schedule.h     (Zach & Howard protocol)
-//  Do not redefine anything from either file here.
+//  calibration.h = electrical truth.  schedule.h = mission timing.
+//  Do not redefine anything from either here.
 //
-//  ============================ 2026-08-18c REWRITE ===========================
-//  The mission is now an ABSOLUTE SCHEDULE, not a fixed-interval loop. This
-//  changes almost everything below the servo primitives. What and why:
+//  MISSION MODEL
+//  • Absolute schedule. Each sleep is next_event_time - elapsed_now, so time
+//    spent awake comes out of the following sleep instead of pushing every
+//    later event back. A fixed-delta scheme accumulated >1 h of lag.
+//  • No operator arm step: a fresh power-on self-arms and starts the clock.
+//    The web UI is a SERVICE interface (check / abort), not the arming path.
+//  • LED1 blinks on every fresh boot, before anything moves — Rev K's proof
+//    that the U10 latch caught.
+//  • WiFi is windowed. 2.4 GHz does not reach 300 m, so a permanent AP burns
+//    ~120 mA to talk to nobody. Windows on boot, on unexpected resets, and
+//    after each event; never on a heartbeat wake.
+//  • Any reset resumes the mission. Resuming only on deep-sleep/brownout meant
+//    a watchdog or panic stopped the mission forever, unheard, at depth.
+//  • Low battery logs and skips. It does not actuate — valves already hold.
+//  • Mission end: no park. The last event leaves sample valves closed and
+//    common open, which is the intended recovery state.
 //
-//  • CLOCK. t=0 is power-on (deployment plug latches U10). Each sleep is
-//    computed as  next_event_time - elapsed_now,  so time spent awake comes
-//    out of the following sleep instead of pushing every later event back.
-//    Under the old fixed-delta scheme the ~126 s routine plus service windows
-//    would have accumulated well over an hour of lag across the mission.
+//  VALVE RULES
+//  • Resting state (Ch0-19 closed, Ch20 open) is a PRECONDITION set on the
+//    bench via the calibrate build's `rest`, not asserted at power-up. It used
+//    to be, costing 21 actuations per boot — and esptool resets the board after
+//    an upload, so every flash was a boot. NO PATH HERE MOVES A VALVE OUTSIDE A
+//    SCHEDULED EVENT, except under operator control in Testing Mode.
+//  • railUpAllCommanded() loads all 21 channels before energising. A servo
+//    powered with no pulse train drives to ~90 deg = OPEN. See its comment.
+//  • Valve positions read UNKNOWN after a boot, because they are.
 //
-//  • NO OPERATOR ARM STEP. A fresh power-on self-arms (given a stamped unit ID
-//    and committed calibration) and starts the clock. This matches the Rev K
-//    deployment procedure — install plug, confirm, it runs — and the protocol
-//    sheet's own "seconds since powered on" origin. The web UI is now a
-//    SERVICE interface (check / abort), not the arming mechanism.
-//
-//  • ARM CONFIRMATION. LED1 now blinks on every fresh boot, before anything
-//    moves, which is what Rev K Section 16 step 3 actually asks for: proof the
-//    U10 latch caught. Previously the LED only blinked after a web button
-//    press, so an operator following the deck procedure would have seen
-//    nothing on plug-in and concluded the unit was dead.
-//
-//  • WIFI IS WINDOWED. 2.4 GHz does not propagate at 300 m, so a permanent AP
-//    would burn ~120 mA to talk to nobody. The AP comes up for AP_WINDOW_MS on
-//    boot, on unexpected resets, and after each sample event (never on a
-//    heartbeat wake), then drops. Note the old ARM MODE ran the AP with NO
-//    idle timeout at all — a latched unit left on deck overnight would have
-//    quietly eaten ~2.9 Ah, over 10% of the pack, before the mission started.
-//
-//  • RESUME ON ANY RESET. The old guard resumed only on ESP_RST_DEEPSLEEP or
-//    ESP_RST_BROWNOUT; a watchdog or panic mid-mission fell through to the AP
-//    and the mission stopped forever, unheard, at depth. Any reset now resumes.
-//
-//  • LOW BATTERY NO LONGER ACTUATES. The old low-battery path called
-//    parkAllClosed() — 21 actuations, i.e. it responded to a weak pack by
-//    performing the single largest actuation in the firmware. Valves already
-//    hold their positions passively, so a low battery now logs, skips the
-//    event, and sleeps without touching the rail.
-//
-//  • RESTING STATE IS A PRECONDITION, NOT A STARTUP ACTION (Howard, 2026-08-19).
-//    Common (Ch20) rests OPEN, sample valves rest CLOSED, and the mission both
-//    starts and ends in that state. This build NO LONGER establishes it on
-//    power-up. It used to, which meant 21 actuations every single boot — and
-//    since esptool resets the board at the end of an upload, every FLASH was a
-//    boot. A bench day with ten flashes silently cost 210 valve movements
-//    before anyone ran a test. The operator now sets the state deliberately,
-//    once, via the calibrate build's `rest` command as the last step of bench
-//    setup. The guarantee this buys:
-//
-//        NO CODE PATH IN THIS BUILD MOVES A VALVE OUTSIDE A SCHEDULED SAMPLE
-//        EVENT, EXCEPT UNDER OPERATOR CONTROL IN TESTING MODE.
-//
-//    Mass sweeps are gated behind Testing Mode for the same reason. Valve
-//    positions read UNKNOWN after a boot, because they are.
-//
-//  • MISSION END. Each event closes its own sample valve, and the last event
-//    ends with common open — so the desired end state already exists and there
-//    is no final park. Dropping it also avoids 20 actuations at the lowest-
-//    battery moment of the mission, which is when a stall is most likely.
-//
-//  Unchanged: ≤2-servo guard, rail gating via GPIO25, PCA sleep before deep
-//  sleep, R15/R13 copper pulldowns hold the gate chain off while GPIO25
-//  floats, latchOff() ends the mission on battery (deep-sleep tail is the
-//  USB/no-latch bench fallback only).
-//
-//  NOT YET BENCH-CONFIRMED: MAIN_CLOSE_OFFSET_DEG (calibration.h), the low-battery
-//  cutoff below (Rev K Section 15 item 2 — needs the 8 degC discharge test),
-//  and passive hold.
+//  NOT BENCH-CONFIRMED: MAIN_CLOSE_OFFSET_DEG, STEP_SETTLE_MS at temperature,
+//  VBATT_CUTOFF_V (Rev K 15.2 needs the 8 degC discharge test), passive hold.
 // ============================================================================
 
 #include <Arduino.h>
@@ -117,6 +77,11 @@ const uint32_t LED_CONFIRM_MS    = 45000;   // 45 s, per Rev K "30-60 s"
 // If the operator aborts the mission, the AP stays up for bench work — but
 // bounded, so a unit left disarmed on deck cannot drain the pack unnoticed.
 const uint32_t BENCH_IDLE_MS  = 3600000UL;  // 1 h
+
+// Wake this early so railUpAllCommanded() (rail settle + hold) completes before
+// the event's t=0, keeping the protocol's 0/4/120/124 offsets exact.
+constexpr uint32_t PRELOAD_MS = RAIL_SETTLE_MS + STEP_SETTLE_MS;
+constexpr uint32_t PRELOAD_S  = (PRELOAD_MS + 999) / 1000;
 
 // ── Per-unit identity ────────────────────────────────────────────────────────
 uint8_t         g_unitId = 0;
@@ -196,6 +161,8 @@ void setPWM(uint8_t ch, uint16_t pulse) {
   else         pwm1.setPWM(ch - 16, 0, pulse);
 }
 
+void railUpAllCommanded();   // defined below; no-op when the rail is already on
+
 bool driveServo(uint8_t ch, uint16_t pulse, ServoPos pos, const char* tag, uint8_t degForLog) {
   if (!servoGuardAllows(ch)) {
     Serial.printf("[GUARD] Ch%2d refused — %u already active (", ch, servoActiveCount());
@@ -203,11 +170,12 @@ bool driveServo(uint8_t ch, uint16_t pulse, ServoPos pos, const char* tag, uint8
     Serial.println(")");
     return false;
   }
+  railUpAllCommanded();     // no-op if already on; never energise uncommanded
   setPWM(ch, pulse);
   servoMarkActive(ch, true);
   servoHasPWM[ch] = true;
   servoPositions[ch] = pos;
-  railOn();
+  railOn();                 // no-op after the line above
   Serial.printf("[%s] Ch%2d → %3d° (pulse %d)\n", tag, ch, degForLog, pulse);
   return true;
 }
@@ -232,6 +200,7 @@ void angleServo(uint8_t ch, uint8_t deg) {
 }
 void sweepServo(uint8_t ch) {
   if (!servoGuardAllows(ch)) { Serial.printf("[GUARD] sweep Ch%2d refused\n", ch); return; }
+  railUpAllCommanded();
   servoMarkActive(ch, true); servoHasPWM[ch] = true; railOn();
   uint16_t lo = min(chOpenPulse[ch], chClosePulse[ch]);
   uint16_t hi = max(chOpenPulse[ch], chClosePulse[ch]);
@@ -263,6 +232,40 @@ void buildPulseTables() {
     servoPositions[i] = POS_UNKNOWN;   // nothing has been commanded yet
   }
 }
+// Resting state is a constant: sample valves closed, common open. A valve is
+// only away from it during the 116 s of its own sample window, and that window
+// lives entirely inside one wake — nothing to persist.
+uint16_t restingPulse(uint8_t ch) {
+  return (ch == MAIN_SERVO_CH) ? chOpenPulse[ch] : chClosePulse[ch];
+}
+
+// Energise the rail with EVERY channel already commanded.
+//
+// A servo that powers up with no pulse train drives to its ~90 deg neutral,
+// which is functionally OPEN on all 21 channels (see the railOn() warning in
+// calibration.h). Commanding only the target channel therefore threw the other
+// twenty valves open at every rail-up. Loading all 21 first gives each servo
+// something to follow the instant power arrives, so none of them defaults.
+// Servos already in position just hold; a drifted one corrects itself.
+//
+// DOCUMENTED EXCEPTION to the <=2 rule (Howard, restated as "<=2 servos
+// MOVING"): this holds all 21 for STEP_SETTLE_MS. Holding is not moving —
+// bench measurement was ~0.32 A for 21 idle servos and ~+0.01 A per servo
+// holding, so roughly 0.5 A for one second, against F3 at 10 A. There is no
+// alternative: the jump hits every servo at the instant power arrives, so
+// preventing it requires all of them commanded at that moment.
+void railUpAllCommanded() {
+  if (railIsOn()) return;
+  for (uint8_t ch = 0; ch <= MAIN_SERVO_CH; ch++) {
+    setPWM(ch, restingPulse(ch));
+    servoPositions[ch] = (ch == MAIN_SERVO_CH) ? POS_OPEN : POS_CLOSE;
+  }
+  Serial.println("[RAILUP] all 21 channels commanded, then power");
+  railOn();
+  delay(STEP_SETTLE_MS);
+  releaseAll();             // limp, each holding its correct position
+}
+
 void initServoDrivers() {
   Wire.begin(I2C_SDA, I2C_SCL);
   pwm0.begin(); pwm0.reset(); delay(10);
@@ -772,6 +775,17 @@ void runMissionWake(bool freshBoot, bool unexpectedReset) {
   bool low = batteryTooLow(vb);
   if (low) Serial.printf("[WAKE]  LOW BATTERY %.2f V < %.2f V — no actuation this wake\n", vb, VBATT_CUTOFF_V);
 
+  // Rail up with all channels commanded, then wait for the event's exact t=0.
+  // Doing this before the routine (rather than inside its first drive) is what
+  // stops the other twenty valves defaulting open when power arrives.
+  if (!low && st.evtIdx < EVENT_COUNT) {
+    uint32_t due = eventTimeS(st.evtIdx);
+    if (missionElapsedS() + PRELOAD_S >= due) {
+      railUpAllCommanded();
+      while (missionElapsedS() < due) delay(50);
+    }
+  }
+
   // Run everything that is due. Normally 0 or 1; more only after an outage.
   bool ranEvent = false;
   while (st.evtIdx < EVENT_COUNT && missionElapsedS() >= eventTimeS(st.evtIdx)) {
@@ -796,7 +810,8 @@ void runMissionWake(bool freshBoot, bool unexpectedReset) {
   // through the long gaps (up to 59h55m) instead of once every event.
   uint32_t now    = missionElapsedS();
   uint32_t target = eventTimeS(st.evtIdx);
-  uint32_t sleepS = (target > now) ? (target - now) : 1;
+  uint32_t wake   = (target > PRELOAD_S) ? (target - PRELOAD_S) : 0;   // preload room
+  uint32_t sleepS = (wake > now) ? (wake - now) : 1;
   if (sleepS > HEARTBEAT_S) {
     sleepS = HEARTBEAT_S;
     Serial.printf("[WAKE]  heartbeat sleep (%lu s to event %u)\n",

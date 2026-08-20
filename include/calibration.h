@@ -2,88 +2,9 @@
 #include <Arduino.h>
 
 // =============================================================================
-//  calibration.h — SINGLE SOURCE OF ELECTRICAL TRUTH for the Karen valve system
-//  Rev K · post short-fix review (2026-07-27)
-//
-//  Every build (deploy / bench / calibrate) #includes this. If a value lives
-//  here it must NOT be redefined in any main.cpp — change it once, rebuild all
-//  three. This is what stops a "95°" in one firmware from meaning something
-//  different in another.
-//
-//  CHANGES in this revision:
-//    • railOn()/railOff() track rail state in a variable instead of
-//      digitalRead() on an OUTPUT pin (unreliable across ESP32 cores; a false
-//      "off" would have re-run the old pulse dance and cut the rail mid-hold).
-//    • railOn() is now a single clean edge + RAIL_SETTLE_MS. The old
-//      prime/rest/go pulse sequence was a workaround for the SERVO_RAIL short
-//      (rail sat at ~3V and servos half-booted); root cause is fixed, and
-//      re-pulsing doubles inrush events. railCycle() remains for deliberate
-//      power-cycle tests from the calibrate CLI.
-//    • Shared ≤2-servo concurrency tracker (design rule: valve + common,
-//      never more). All builds must route drive/release through it.
-//    • latchOff() added for the deploy build's real mission-final shutdown.
-//    • Fail-safe note corrected: Rev K already has the float-window pulldowns
-//      in copper (R15, R13) — verify with a meter, no bodges required.
-//
-//  CHANGES 2026-08-18 (calibration update — A/B/C/D relabel):
-//    • The team now refers to the four physical units as Landers A/B/C/D on
-//      the bench instead of numbers. This is a LABELING change only — the
-//      firmware identity system underneath (NVS unitID, setid <n>, SSID
-//      LanderController1..4) is UNCHANGED. See the mapping note above
-//      CH_OPEN_DEG_ALL below.
-//    • Bench angles for the three new units (A, B, C) pasted in; the
-//      previously-existing committed row becomes Lander D (was "Lander 1").
-//      All four rows are now real, non-placeholder data — CAL_COMMITTED is
-//      all true.
-//    • Lander C is missing/has burnt-out servos on Ch18-19. No structural
-//      change to SAMPLE_SERVO_COUNT/SERVO_CHANNELS was made (team's call —
-//      handle it operationally rather than teach the firmware a per-lander
-//      valve count). C's row carries placeholder angles on Ch18-19 only —
-//      see the note on that row.
-//    • Added closeDegFor(ch, openDeg): the main/intake valve (Ch20) now
-//      always closes to a hardcoded 180°, instead of open+CLOSE_OFFSET_DEG
-//      like the sample valves. Both main.cpp builds must call this helper
-//      instead of inlining the close-angle formula (deploy's closeServo() /
-//      buildPulseTables(), the calibrate CLI's `table` command).
-//    • CORRECTION (same day): the first A/B/C numbers had Lander C's Ch7-17
-//      wrong (off-by-one from the real bench sheet). A and B were correct
-//      and are unchanged. Fixed C below — it now only has 2 dead channels
-//      (Ch18-19), not 4; Ch16-17 turned out to have real angles.
-//
-//  CHANGES 2026-08-18b (main-valve stop margin + compile-time table check):
-//    • The main valve's close angle stops being a hardcoded 180 inside
-//      closeDegFor() (see the 2026-08-19 entry for where it ended up). The
-//      main valve was being commanded to the absolute end of the pulse range
-//      (180° = 512 counts = 2500 us), i.e. straight into the mechanical stop,
-//      on every close — twice per sample event plus every park. Backing it to
-//      a named constant gives a defined cushion instead of none, and makes the
-//      cushion a decision rather than a by-product of each servo's open trim.
-//      *** THE COMMON VALVE'S CLOSE ANGLE IS NOT YET BENCH-CONFIRMED. ***
-//    • static_assert block added at the bottom of this file. tools/
-//      check_calibration.py only runs in CI, and firmware is routinely flashed
-//      offline from a locally-edited copy of this header, so a bad table could
-//      reach a board without ever passing the lint. These asserts make the
-//      same class of mistake a compile error instead.
-//
-//  CHANGES 2026-08-19b (main valve back to an offset — Sophie/Howard):
-//    • MAIN_CLOSE_DEG (a fixed 175°) is replaced by MAIN_CLOSE_OFFSET_DEG with a
-//      MAIN_CLOSE_MAX_DEG (175°) ceiling. A pinch valve closes as a function of
-//      TRAVEL from its calibrated open position, and the open angle already
-//      absorbs each servo's horn offset — so a fixed absolute angle gave the
-//      fleet inconsistent travel (D/B 85°, C 75°, A 70°). The offset holds
-//      travel constant on every unit; the cap protects the stop.
-//    • _calMainCloseFits() fails the build if any unit would clamp, because a
-//      clamped unit silently gets less travel than the rest of the fleet.
-//
-//  CHANGES 2026-08-19c (offset set from the bench — Sophie):
-//    • MAIN_CLOSE_OFFSET_DEG = 45, measured on Lander A: its Ch20 opens at 105°
-//      and its best close position is 150°. A is the unit with the furthest-
-//      forward visual zero, i.e. the highest Ch20 open angle in the fleet.
-//    • NOTE this is LESS travel than a sample valve gets (65°), which reverses
-//      the earlier assumption that the common valve needed near-full travel.
-//      That assumption came from an old comment, not from a measurement; the
-//      measurement wins. Comments that asserted it have been corrected.
-//    • Described as "not a perfect seal but a good one for now" — interim.
+//  calibration.h — electrical truth for the Karen valve system (Rev K).
+//  Included by deploy / minideploy / calibrate. If a value lives here, do not
+//  redefine it in a main.cpp. Mission timing lives in schedule.h.
 // =============================================================================
 
 // ---- I2C + PCA9685 boards ---------------------------------------------------
@@ -109,88 +30,43 @@ constexpr uint8_t SAMPLE_SERVO_COUNT = 20;   // sample valves = Ch0..19
 constexpr uint8_t SERVO_CHANNELS[SAMPLE_SERVO_COUNT] =
   {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19};
 
-// ---- Calibration result — PER LANDER ----------------------------------------
-//  Open angles are trimmed to each INDIVIDUAL servo (visual centre, ~90°) and
-//  therefore differ per physical lander. Each lander carries its own 21-value
-//  row in CH_OPEN_DEG_ALL, selected at runtime from the unit ID stored in NVS
-//  (see the assembly build's loadUnitId()). ONE binary ships to all four units.
+// ---- Per-lander calibration ------------------------------------------------
+//  Open angles are trimmed per servo (visual centre, ~90 deg) so they differ per
+//  unit. Row selected at runtime from the unit ID in NVS; one binary ships to
+//  all four. A row with CAL_COMMITTED false REFUSES TO ARM.
 //
-//  Closed = open + CLOSE_OFFSET_DEG, clamped to 180, for every SAMPLE valve
-//  (Ch0-19). 65° is the max offset that keeps every sample channel at/under
-//  180: the highest committed open angle is 115° (Lander D Ch13, Lander C
-//  Ch10), so 115 + 65 = 180 exactly — that's the binding case setting this
-//  ceiling. Ch20 (MAIN_SERVO_CH) does NOT use this formula: the main valve
-//  uses its own offset (MAIN_CLOSE_OFFSET_DEG, capped at MAIN_CLOSE_MAX_DEG).
-//  As measured it needs LESS travel than a sample valve, not more — 45° vs 65°.
+//  Per unit:  setid <n> (calibrate build) -> calibrate 21 servos -> paste the
+//  open angles into row (n-1) -> CAL_COMMITTED[n-1] = true -> commit -> flash.
 //
-//  WORKFLOW per unit:  `setid <n>` on the calibrate build (stamps NVS) →
-//  calibrate the 21 servos → paste that unit's open angles into row (n-1)
-//  below → flip CAL_COMMITTED[n-1] to true → commit → flash the assembly build.
-//  A unit whose row is still a placeholder (CAL_COMMITTED false) REFUSES TO ARM.
+//  Sample valves (Ch0-19) close at open + CLOSE_OFFSET_DEG, clamped to 180.
+//  65 is the ceiling: highest committed open angle is 115, and 115+65 = 180.
+//  Ch20 (common) uses its own offset — see MAIN_CLOSE_OFFSET_DEG.
 //
-//  LABELING: the team refers to the four physical units as Landers A/B/C/D on
-//  the bench, but the firmware's identity system is unchanged underneath —
-//  units are still numbered 1-4 in NVS/SSID/setid. The mapping is:
-//    unit 1 = Lander D (existing, previously "Lander 1")
-//    unit 2 = Lander A
-//    unit 3 = Lander B
-//    unit 4 = Lander C  (missing/burnt-out Ch18-19 — see note on that row)
-//  If a physical unit gets relabeled, update this comment AND the row
-//  headers below — nothing here enforces the letter mapping automatically.
+//  LABELING: the bench calls these Landers A/B/C/D; the firmware only knows
+//  1-4. Nothing enforces the mapping — update this comment if a unit is
+//  relabelled.
+//    unit 1 = D    unit 2 = A    unit 3 = B    unit 4 = C
 constexpr uint8_t CLOSE_OFFSET_DEG = 65;     // !! MAX 65 — 115° hits 180 !!
 constexpr uint8_t LANDER_COUNT     = 4;
 
-//  ---- MAIN / COMMON valve (Ch20) close angle --------------------------------
-//  Ch20 closes at open + MAIN_CLOSE_OFFSET_DEG, capped at MAIN_CLOSE_MAX_DEG.
-//  Sample valves are unaffected and still use open + CLOSE_OFFSET_DEG.
+//  ---- Common valve (Ch20) close angle ---------------------------------------
+//  Closes at open + MAIN_CLOSE_OFFSET_DEG, capped at MAIN_CLOSE_MAX_DEG.
+//  An offset, not a fixed angle: a pinch valve closes as a function of TRAVEL
+//  from its calibrated open position, so a fixed angle gave the fleet
+//  inconsistent travel (70-85 deg).
 //
-//  *** NOT YET BENCH-CONFIRMED. Starting values only. ***
+//  45 measured on Lander A: Ch20 opens at 105, best close is 150. A has the
+//  highest Ch20 open angle in the fleet, so it sets the ceiling — at offset 75
+//  it would land on 180, the mechanical stop. INTERIM: "a good seal, not a
+//  perfect one". Less travel than a sample valve (65 deg), which reverses an
+//  older assumption that the common valve needed near-full travel.
 //
-//  WHY AN OFFSET AND NOT A FIXED ANGLE (changed 2026-08-19, Sophie/Howard):
-//  A pinch valve closes as a function of how far the horn TRAVELS from its
-//  calibrated open position — the open angle already absorbs each servo's horn
-//  offset, so travel-from-open is the meaningful quantity and absolute angle is
-//  not. This was previously a fixed 175°, which gave inconsistent travel across
-//  the fleet (D and B 85°, C 75°, A 70°). An offset holds travel constant and
-//  lets the cushion vary, which is the right way round: sealing depends on
-//  travel, and the cap below is what protects the stop.
+//  At 45:  D 90->135   A 105->150   B 90->135   C 100->145
 //
-//  WHERE 45 CAME FROM: measured on Lander A, whose Ch20 opens at 105° and whose
-//  best close position is 150°. A has the furthest-forward visual zero, i.e. the
-//  highest Ch20 open angle in the fleet. Sophie's note: "might not be a perfect
-//  seal but it'll be a good one at least for now" — this is an interim value.
-//
-//  At offset 45:  D 90->135   A 105->150   B 90->135   C 100->145
-//  Closest approach to the 180° mechanical stop is A at 150 — 30° of cushion,
-//  so MAIN_CLOSE_MAX_DEG is inert at this offset and serves purely as a backstop
-//  if the offset is ever raised. The low end has had a guard for a while
-//  (SERVO_MIN_DEG = 70; commanding below it is what stalled Ch20/Ch14 on the
-//  bench) and 135 is well clear of that too.
-//
-//  THE ASSUMPTION THIS RESTS ON: that 45° of travel from open means the same
-//  physical motion on every unit — which holds only if "open" was calibrated to
-//  the same physical position (fully open, no strain) on all four. It was
-//  measured on A alone.
-//  SPOT-CHECK IT ON D OR B: they have the lowest Ch20 open angle (90°), so they
-//  close at 135° and are where a bad transfer would show up first as
-//  under-travel. Two minutes with `table` then `20 135` then `r 20`.
-//
-//  BENCH TASK: confirm per unit during the Rev K Section 14 cold/oil test at
-//  ~8 °C — drive Ch20 to its close angle, cut PWM, verify sealed and no creep.
-//  If the four units disagree, this becomes a per-lander row indexed [unitID-1]
-//  like CH_OPEN_DEG_ALL.
-//
-//  Two things make the cushion matter more than it looks:
-//    • The pack is 6 V nominal (2x PS-6100 in parallel) and the HPS-2018 is
-//      rated 6.0-8.4 V, so the servos run at/below their minimum rating for
-//      most of the discharge — slower and weaker than the 0.20 s/60° @ 7.4 V
-//      datasheet figure.
-//    • The servos are submerged in oil at ~8 °C, which the datasheet figure
-//      does not account for at all.
-//  A servo that cannot finish its stroke inside STEP_SETTLE_MS ends up both
-//  under-travelled (no seal) AND stalled for the whole settle window. Stall
-//  current is 1.4-2.3 A per Hiwonder vs the ~0.227 A the 2-servo path is
-//  certified for.
+//  Assumes 45 deg of travel is the same physical motion on every unit, which
+//  holds only if "open" was calibrated to the same physical position on all
+//  four. Measured on A alone — spot-check D or B (lowest open angle, so a bad
+//  transfer shows there first). Confirm sealed + no creep at ~8 degC in oil.
 constexpr uint8_t MAIN_CLOSE_OFFSET_DEG = 45;    // travel from open, per unit
 constexpr uint8_t MAIN_CLOSE_MAX_DEG    = 175;   // hard ceiling: 5° off the stop
 
@@ -203,12 +79,21 @@ constexpr uint8_t CH_OPEN_DEG_ALL[LANDER_COUNT][21] = {
   // ── unit 2 · Lander A ──  bench-confirmed 2026-08-18
   {  95,  90,  90,  95, 100,  90,  85,  95,    // Ch0-7
     100, 100, 100,  90, 100,  95,  95, 105,    // Ch8-15
-   105, 100,  95,  95, 100 },                  // Ch16-20 (Ch20 = main)
+   105, 100,  95,  95, 105 },                  // Ch16-20 (Ch20 = main)
   // ── unit 3 · Lander B ──  bench-confirmed 2026-08-18
   {  95, 100, 100, 105, 100, 100,  95, 100,    // Ch0-7
    110,  95, 110,  90,  95, 105,  95, 100,     // Ch8-15
    100, 100, 110, 100,  90 },                  // Ch16-20 (Ch20 = main)
-  // ── unit 4 · Lander C ──  bench-confirmed 2026-08-18
+  // ── unit 4 · Lander C ──  bench-confirmed 2026-08-18 — Ch18-19 PLACEHOLDER
+  //    Servos on Ch18-19 are burnt out / missing on this physical unit. The
+  //    two values below (95, 90 — copied from Lander D) are NOT real bench
+  //    angles; they only exist so degToPulse()/buildPulseTables() never
+  //    operate on an uninitialized/garbage value. Per the team's call, the
+  //    firmware was NOT changed to skip these channels for C — those
+  //    physical ports must not be wired to real sample valves on this unit,
+  //    and C's mission will spend 2 of its 20 sample wake cycles opening/
+  //    closing dead or unconnected ports (harmless, just wasted cycles).
+  //    Ch0-17 and Ch20 (main) below ARE real bench-confirmed angles.
   {  95, 100, 105, 100,  95, 100,  95, 100,    // Ch0-7 (real)
     95,  90, 115, 105, 105, 105, 100, 100,     // Ch8-15 (real)
    100, 105,  95,  90, 100 },                  // Ch16-17 real, Ch18-19 PLACEHOLDER, Ch20 real (main)
@@ -248,11 +133,11 @@ inline uint8_t closeDegFor(uint8_t ch, uint8_t openDeg) {
 // the calibrate CLI refuses smaller values. (Bench "raw" mode should too.)
 constexpr uint8_t SERVO_MIN_DEG = 70;
 
-// ---- Concurrency rule -------------------------------------------------------
-//  Design rule (Howard): only one or two servos move/hold at a time — the
-//  selected valve plus Common, never more. This is enforced structurally at
-//  the drive-primitive level so NO code path (UI, CLI, state machine, park
-//  routine) can stampede the servo rail.
+// ---- Concurrency rule ------------------------------------------------------
+//  Design rule (Howard): only one or two servos MOVE at a time — the selected
+//  valve plus common. Enforced at the drive primitive so no code path can
+//  stampede the rail. See railUpAllCommanded() in the builds for the one
+//  documented exception: all 21 are briefly HELD (not moved) at rail-up.
 constexpr uint8_t MAX_ACTIVE_SERVOS = 2;
 
 //  Shared active-channel tracker. Every build must:
@@ -320,8 +205,18 @@ inline void initPowerPins() {
   _railState() = false;
 }
 
-// Single clean rising edge + settle. Call AFTER the PWM signal is set so the
-// servo sees a valid pulse train the instant power arrives. No-op if already on.
+// Single clean rising edge + settle. No-op if already on.
+//
+// *** WARNING — read before calling this directly. ***
+// Any servo powered by this call WITHOUT a valid pulse train already loaded
+// drives to its ~90 deg neutral. Open angles are calibrated to "visual centre,
+// ~90 deg", so that is functionally OPEN on all 21 channels: a bare railOn()
+// from a cold rail throws every uncommanded valve open. Measured on HPS-2018
+// 2026-08-19 — it reproduces with the signal wire physically unplugged, so it
+// is the servo, not the PCA9685.
+//
+// Load pulses for ALL channels first. Both builds provide railUpAllCommanded()
+// for exactly this; call that, not this, when the rail is cold.
 inline void railOn() {
   if (_railState()) return;
   digitalWrite(SERVO_EN_PIN, HIGH);

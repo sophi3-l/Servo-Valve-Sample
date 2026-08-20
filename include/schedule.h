@@ -3,54 +3,29 @@
 #include "calibration.h"
 
 // =============================================================================
-//  schedule.h — SAMPLING PROTOCOL AUTHORITY for the Karen valve system
-//  Zach & Howard sampling protocol, transcribed 2026-08-18
+//  schedule.h — mission timing. Zach & Howard sampling protocol, 2026-08-18.
+//  calibration.h owns electrical truth; this owns WHEN. Keep them separate.
 //
-//  calibration.h owns ELECTRICAL truth (pins, angles, rail, guard).
-//  This file owns MISSION TIMING. Keep them separate: an angle change and a
-//  schedule change are different reviews by different people.
+//  t = 0 is POWER-ON (deployment plug latches U10, ESP32 boots). No operator
+//  arm step. Matches the protocol sheet's "seconds since powered on".
 //
-//  ---------------------------------------------------------------------------
-//  CLOCK ORIGIN
-//  ---------------------------------------------------------------------------
-//  t = 0 is POWER-ON — the moment the deployment plug shorts SubConn pins 3-4,
-//  the ARM one-shot pulses U10 ON, and the ESP32 boots. There is no operator
-//  "arm" step in the flight path; the unit self-starts. This matches the
-//  protocol sheet's own column header ("Seconds since powered on") and the
-//  Rev K deployment procedure (install plug -> confirm -> it runs).
+//  SHEET 1 "Sampling Protocol" is the authority. Sheet 2 "Lander+Samples" is
+//  the whole-lander view on a clock 3300 s (1 h - 5 min) earlier; its 12
+//  "valve opens to ambient / closes to inc N" rows belong to the LANDER, not
+//  this controller (see its "Lander Programming (Ignore)" note). Common rests
+//  OPEN and closes only inside a sample event. Do not add those 12 events.
 //
-//  ---------------------------------------------------------------------------
-//  WHICH SHEET THIS CAME FROM
-//  ---------------------------------------------------------------------------
-//  The protocol workbook has two sheets whose clocks differ by exactly 3300 s
-//  (= 1 h - 5 min). Sheet 1 "Sampling Protocol" is the authority for THIS
-//  controller: its origin is power-on, and the 5 min is the deck WiFi/service
-//  window. Sheet 2 "Lander+Samples" is the whole-lander view on a different
-//  origin; every one of its sample rows equals Sheet 1 minus 3300 s.
+//  PER-EVENT ROUTINE. The protocol fixes WHEN commands are issued, not how long
+//  the servo stays powered. Keeping them separate means the release time can be
+//  tuned for valve wear without shifting the schedule.
 //
-//  Sheet 2 also lists "valve opens to ambient" / "valve closes to inc N"
-//  events. THOSE ARE NOT OURS — they belong to the lander's own programming
-//  (see the "Lander Programming (Ignore)" annotation on that sheet). Our
-//  common valve (Ch20) rests OPEN and is closed only for the duration of a
-//  sample event. Do not add those 12 events to the table below.
+//      0 s  close common        released at cmd + STEP_SETTLE_MS
+//      4 s  open sample n
+//    120 s  close sample n
+//    124 s  open common
 //
-//  ---------------------------------------------------------------------------
-//  PER-EVENT ROUTINE
-//  ---------------------------------------------------------------------------
-//  The protocol fixes WHEN each command is issued. It does NOT fix how long the
-//  servo stays powered afterwards — that is a separate, independently tunable
-//  quantity. Keeping the two apart means the release time can be changed for
-//  valve-wear reasons WITHOUT shifting the sampling schedule by a single second.
-//
-//    COMMAND OFFSET (fixed by protocol)    RELEASE (= command + STEP_SETTLE_MS)
-//        0 s   close common                    0 s + settle
-//        4 s   open sample n                   4 s + settle
-//      120 s   close sample n                120 s + settle
-//      124 s   open common                   124 s + settle
-//
-//  The sample valve is open from 4 s to 120 s = 116 s, and common is closed
-//  from 0 s to 124 s, whatever the settle is. Those are the numbers the science
-//  depends on, and they are structurally protected from the wear tuning.
+//  Sample valve open 4->120 = 116 s; common closed 0->124 = 124 s. Both hold at
+//  any settle value, and both are static_asserted below.
 // =============================================================================
 
 // ---- Command offsets within an event (protocol — do not change) -------------
@@ -59,29 +34,18 @@ constexpr uint32_t CMD_OPEN_SAMPLE_MS  = 4000;
 constexpr uint32_t CMD_CLOSE_SAMPLE_MS = 120000;
 constexpr uint32_t CMD_OPEN_COMMON_MS  = 124000;
 
-// ---- How long a servo stays powered after a command -------------------------
-//  THIS IS THE VALVE-BURNOUT BUDGET, and it is the only thing that controls it.
+// ---- Release time: the valve-burnout budget --------------------------------
+//  A servo that REACHED its position holds at near-idle. One that CANNOT reach
+//  it (bind, or commanded into a stop) draws stall current — 1.4-2.3 A vs the
+//  ~0.227 A the 2-servo path is certified for — for exactly this long. So this
+//  only matters in the fault case, where it is the whole exposure.
 //
-//  A servo that has REACHED its commanded position is not stalling — it holds
-//  at near-idle. A servo that CANNOT reach position (mechanical bind, or
-//  commanded into a stop) draws stall current — 1.4-2.3 A per Hiwonder, versus
-//  the ~0.227 A the 2-servo path is certified for — for exactly this long.
-//  Shorter = less damage in a fault. Longer = more certainty the valve seated.
-//
-//  1000 ms, set 2026-08-19 (Howard). Basis: a pinch-close was timed at ~0.75 s
-//  on the bench, giving ~33% headroom.
-//
-//  *** THAT MEASUREMENT WAS AT ROOM TEMPERATURE, IN AIR, ON A BENCH SUPPLY. ***
-//  Flight is ~8 degC, submerged in oil, on a 6 V pack that sits at or below the
-//  HPS-2018's 6.0 V minimum rating for most of its discharge. All three make
-//  the stroke SLOWER, and 33% is not a lot of margin to give away. A stroke
-//  that overruns this window leaves the valve under-travelled (no seal) AND
-//  stalled for the whole window — both failure modes at once.
-//
-//  RE-MEASURE IN OIL AT TEMPERATURE BEFORE FLIGHT. Watching the bench supply's
-//  current readout during a single command is enough: current rises through the
-//  stroke and drops when the servo arrives. Raising this costs one constant and
-//  shifts no schedule.
+//  1000 ms (Howard, 2026-08-19), from a ~0.75 s bench pinch-close: ~33% margin.
+//  THAT WAS ROOM TEMPERATURE, IN AIR, ON A BENCH SUPPLY. Flight is ~8 degC, in
+//  oil, on a 6 V pack at or below the HPS-2018's 6.0 V rating — all slower. A
+//  stroke that overruns leaves the valve under-travelled AND stalled for the
+//  whole window. RE-MEASURE IN OIL AT TEMPERATURE BEFORE FLIGHT: watch the
+//  supply current during one command, it drops when the servo arrives.
 constexpr uint16_t STEP_SETTLE_MS = 1000;
 
 // Breather between servos in a SEQUENTIAL SWEEP (the calibrate build's `rest`,
@@ -128,31 +92,21 @@ constexpr uint32_t SAMPLE_TIME_S[EVENT_COUNT] = {
 };
 //  Mission ends 126 s after the last event: 1,558,338 s = 432.87 h = 18.04 d.
 
-// ---- Heartbeat --------------------------------------------------------------
-//  The schedule has gaps up to 59h55m. Twenty wakes across eighteen days is
-//  very few battery readings, and nothing at all for the first 32h55m, so we
-//  insert no-actuation wakes that log battery + elapsed and go straight back
-//  to sleep. Cost is ~1 s of ESP32 active current each: ~1.2 mAh across the
-//  whole mission against a ~8,700 mAh sleep budget. Effectively free.
+// ---- Heartbeat -------------------------------------------------------------
+//  Gaps run to 59h55m and nothing happens for the first 32h55m. These wakes log
+//  battery + elapsed and sleep again, no actuation: ~1.2 mAh across the mission
+//  against a ~8,700 mAh sleep budget.
 #ifdef MINI_DEPLOY
 constexpr uint32_t HEARTBEAT_S = 60;         // exercise the path in rehearsal
 #else
 constexpr uint32_t HEARTBEAT_S = 6UL * 3600UL;
 #endif
 
-// ---- MINI_DEPLOY compression ------------------------------------------------
-//  Rehearsal rule (decided 2026-08-18): compress the WAITS ONLY. The 126 s
-//  routine runs at full flight timing — 2 s settles, 116 s sample-open — so a
-//  rehearsal exercises the real servo behaviour, which is the part that is
-//  actually untested at 8 degC in oil on a 6 V pack.
-//
-//  Consequence: a full 20-sample rehearsal cannot be shorter than
-//  20 x 126 s = 42 min. With the divisor below it lands around 55 min.
-//  That is a lunch break, not a coffee break. This is deliberate.
-//
-//  Gaps are scaled proportionally rather than flattened, so the rehearsal
-//  still walks the real irregular table (8h / 20h / 60h gaps stay in
-//  proportion) instead of a uniform stride that would not exercise it.
+// ---- MINI_DEPLOY compression -----------------------------------------------
+//  Compress the WAITS only; the routine runs at full flight timing, because the
+//  servo behaviour is the untested part (8 degC, oil, 6 V pack). Floor: 20 x
+//  125 s = 42 min; lands ~55 min. Gaps scale proportionally rather than
+//  flattening, so a rehearsal still walks the real irregular table.
 constexpr uint32_t MINI_DIV          = 2000;   // divide the SLEEP portion only
 constexpr uint32_t MINI_MIN_SLEEP_S  = 10;     // floor, so events never collide
 

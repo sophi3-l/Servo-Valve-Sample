@@ -90,6 +90,8 @@ void applyPWM(uint8_t ch, uint16_t pulse) {
 }
 
 // ── Guarded drive / release ──────────────────────────────────────────────────
+void railUpAllCommanded();   // defined below; no-op when the rail is already on
+
 void moveChannel(uint8_t ch, uint8_t deg) {
   if (!servoGuardAllows(ch)) {                      // structural ≤2 rule
     Serial.printf("[GUARD] Ch%u refused — %u already active (", ch, servoActiveCount());
@@ -97,10 +99,11 @@ void moveChannel(uint8_t ch, uint8_t deg) {
     Serial.println("). Release one first:  r <ch>");
     return;
   }
+  railUpAllCommanded();                             // never energise uncommanded
   uint16_t pulse = degToPulse(deg);
   applyPWM(ch, pulse);                              // signal first...
   servoMarkActive(ch, true);
-  railOn();                                         // ...then energize the rail
+  railOn();                                         // no-op after the line above
   if (ch <= 15) Serial.printf("Board 0x40 Ch%u -> %u deg (pulse:%u)\n", ch, deg, pulse);
   else          Serial.printf("Board 0x41 Ch%u (local %u) -> %u deg (pulse:%u)\n",
                               ch, ch - 16, deg, pulse);
@@ -123,6 +126,29 @@ const uint8_t* thisUnitRow() {
   uint8_t id = prefs.getUChar("unitid", 0);
   prefs.end();
   return chOpenRow(id);
+}
+
+// Energise the rail with every channel already commanded. A servo powered with
+// no pulse train drives to its ~90 deg neutral, which is OPEN on all 21
+// channels (see the railOn() warning in calibration.h) — so a bare railOn()
+// from cold throws every valve open before the commanded one moves.
+// No-op once the rail is up, so this costs one preload per bench session.
+void railUpAllCommanded() {
+  if (railIsOn()) return;
+  const uint8_t* row = thisUnitRow();
+  if (!row) {
+    Serial.println("[RAILUP] no lander ID — uncommanded channels will centre (~90 deg)");
+    railOn();
+    return;
+  }
+  for (uint8_t ch = 0; ch <= MAIN_SERVO_CH; ch++) {
+    uint8_t deg = (ch == MAIN_SERVO_CH) ? row[ch] : closeDegFor(ch, row[ch]);
+    applyPWM(ch, degToPulse(deg));
+  }
+  Serial.println("[RAILUP] all 21 channels commanded to resting, then power");
+  railOn();
+  delay(STEP_SETTLE_MS);
+  for (uint8_t ch = 0; ch <= MAIN_SERVO_CH; ch++) releaseChannel(ch);
 }
 
 // ── Battery ADC (same chain as the flight builds — validates the divider) ────
@@ -200,6 +226,9 @@ void loop() {
 
   // Rail on with zero PWM — the GPIO25 HIGH row of Howard's gate table
   if (input == "rail") {
+    Serial.println("[WARN] zero-PWM rail-up: uncommanded servos will centre (~90 deg = OPEN).");
+    Serial.println("       This is the Q2 gate-table test. For normal work use a move command,");
+    Serial.println("       which preloads all channels first.");
     railOn();
     Serial.println("Rail ON, no PWM (GPIO25 HIGH row)");
     return;
