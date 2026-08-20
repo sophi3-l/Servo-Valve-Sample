@@ -35,7 +35,8 @@ the README together.
    - **Sample valves (Ch0–19):** open + `CLOSE_OFFSET_DEG` (65°) must be fully
      closed without grinding. 65 is shared by every channel and is already at its
      ceiling — the highest committed open angle is 115°, and 115 + 65 = 180.
-   - **Common valve (Ch20):** closes to `MAIN_CLOSE_DEG` (175°), *not* open + 65.
+   - **Common valve (Ch20):** closes to `open + MAIN_CLOSE_OFFSET_DEG` (70°),
+     capped at 175° — a larger offset than the sample valves, not open + 65.
      See the note below.
 5. `r <ch>` releases a channel (cuts PWM) so you can re-clock a horn by hand or
    watch for creep. `off` releases everything and drops the rail.
@@ -66,20 +67,32 @@ arm**. Bad angles now also fail the *build* via `static_assert`, not just the li
 
 ## The common valve is different
 
-Ch20 does **not** use the offset formula. It closes to `MAIN_CLOSE_DEG`, a single
-named constant, because the main valve needs near-full travel to seal while the
-sample valves do not.
+Ch20 uses its **own, larger offset** — `open + MAIN_CLOSE_OFFSET_DEG` (70°)
+capped at `MAIN_CLOSE_MAX_DEG` (175°) — because the common valve needs more
+travel to seal than a sample valve does.
+
+It briefly used a fixed 175° instead. That was wrong in a subtle way: a pinch
+valve closes as a function of how far the horn *travels* from its calibrated open
+position, and the open angle already absorbs each servo's horn offset. A fixed
+angle therefore gave inconsistent travel across the fleet (D and B 85°, C 75°,
+A 70°). The offset holds travel constant at 70° everywhere and lets the cushion
+vary; the cap is what protects the stop.
+
+**70 is the largest offset available.** The fleet ceiling is set by the highest
+Ch20 open angle — Lander A at 105° — and at offset 75 A would land exactly on
+180°, the mechanical stop. If a unit turns out to need more than 70° of travel,
+its Ch20 *open* angle has to come down first; that is what frees up headroom.
 
 It previously used a hardcoded **180°** — the absolute end of the commanded pulse
 range (`degToPulse(180)` = 512 counts = 2500 µs), i.e. driven into the servo's
 mechanical stop on every close, twice per sample event plus every park. The low
 end had a guard (`SERVO_MIN_DEG`); the high end had none.
 
-**`MAIN_CLOSE_DEG = 175` is a starting value, not a bench-confirmed one.** It must
-be verified per unit during the Rev K Section 14 cold/oil test at ~8 °C: drive the
-common valve to it, cut PWM, and confirm it is *fully sealed* and does not creep.
-Raise it if a unit needs more travel; if the four units disagree, convert it to a
-per-lander row like `CH_OPEN_DEG_ALL`.
+**`MAIN_CLOSE_OFFSET_DEG = 70` is a starting value, not a bench-confirmed one.**
+Verify per unit during the Rev K Section 14 cold/oil test at ~8 °C: run `table` to
+see the angle this unit will actually drive on Ch20, drive it, cut PWM, and
+confirm it is *fully sealed* and does not creep. If the four units disagree,
+convert it to a per-lander row like `CH_OPEN_DEG_ALL`.
 
 Two things make this cushion matter more than it looks:
 
@@ -95,7 +108,8 @@ the ~0.227 A the two-servo path is certified for.
 ## Recorded angles
 
 Mapping: 50 Hz, 25 MHz oscillator, `map(deg, 0,180, 102,512)` → 102 ≈ 500 µs,
-512 ≈ 2500 µs. `CLOSE_OFFSET_DEG` = 65 (sample valves). `MAIN_CLOSE_DEG` = 175 (Ch20).
+512 ≈ 2500 µs. `CLOSE_OFFSET_DEG` = 65 (sample valves).
+`MAIN_CLOSE_OFFSET_DEG` = 70 capped at 175 (Ch20 common).
 
 Open angles as committed in `calibration.h`:
 
@@ -121,7 +135,7 @@ Open angles as committed in `calibration.h`:
 | 17 | 0x41 | 95 | 100 | 100 | 105 | local 1 |
 | 18 | 0x41 | 95 | 95 | 110 | *95* | local 2 · **C placeholder** |
 | 19 | 0x41 | 90 | 95 | 100 | *90* | local 3 · **C placeholder** |
-| 20 | 0x41 | 90 | 105 | 90 | 100 | local 4 · **COMMON** — closes to 175, not open+65 |
+| 20 | 0x41 | 90 | 105 | 90 | 100 | local 4 · **COMMON** — closes to open+70 (160/175/160/170) |
 
 Lander C's Ch18–19 values are copies of Lander D's and are **not real bench
 angles** — those ports are unpopulated pending the servo transplant. They exist
@@ -141,7 +155,7 @@ longer than the field interval, under representative load. The deep-sleep power
 budget assumes the gear train self-holds; if a channel creeps, it is a mechanical
 fix, not a firmware one.
 
-For Ch20, "Hold-check · closed" doubles as the `MAIN_CLOSE_DEG` seal test.
+For Ch20, "Hold-check · closed" doubles as the common-valve seal test.
 
 Record pass/fail per channel per unit:
 

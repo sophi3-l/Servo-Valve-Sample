@@ -72,7 +72,7 @@
 //  floats, latchOff() ends the mission on battery (deep-sleep tail is the
 //  USB/no-latch bench fallback only).
 //
-//  NOT YET BENCH-CONFIRMED: MAIN_CLOSE_DEG (calibration.h), the low-battery
+//  NOT YET BENCH-CONFIRMED: MAIN_CLOSE_OFFSET_DEG (calibration.h), the low-battery
 //  cutoff below (Rev K Section 15 item 2 — needs the 8 degC discharge test),
 //  and passive hold.
 // ============================================================================
@@ -128,7 +128,8 @@ const uint8_t*  CH_OPEN  = nullptr;
 //  NOTE the servos (HPS-2018) are rated 6.0-8.4 V, so on a 6 V SLA they sit at
 //  or below their minimum rating for most of the discharge. That cannot be
 //  fixed by moving this threshold — it is a pack/servo choice — but it is why
-//  the settle times matter and why MAIN_CLOSE_DEG backs off the stop.
+//  the settle times matter and why the common valve's close angle is capped
+//  short of its mechanical stop.
 //  5.60 V is INHERITED, NOT VALIDATED. Rev K Section 15 item 2 requires it to
 //  come from an 8 degC discharge test with the real load. Read at wake with
 //  the rail off, i.e. a rested reading — the right condition for SoC.
@@ -258,7 +259,7 @@ void moveRangeSequential(uint8_t first, uint8_t last, void (*op)(uint8_t)) {
 void buildPulseTables() {
   for (uint8_t i = 0; i <= 20; i++) {
     chOpenPulse[i]   = degToPulse(CH_OPEN[i]);
-    chClosePulse[i]  = degToPulse(closeDegFor(i, CH_OPEN[i]));   // Ch20 → MAIN_CLOSE_DEG
+    chClosePulse[i]  = degToPulse(closeDegFor(i, CH_OPEN[i]));   // Ch20 → open + MAIN_CLOSE_OFFSET_DEG, capped
     servoPositions[i] = POS_UNKNOWN;   // nothing has been commanded yet
   }
 }
@@ -498,7 +499,7 @@ position is genuinely unknown. Sweeps are in Testing Mode.</div>
     <button class="gr" onclick="cmd('cal_all_mid')">All 90°</button>
   </div>
   <div class="row"><button class="b" onclick="cmd('rest')">Resting state (Ch0–19 closed · common open)</button></div>
-  <div class="warn">Hold-check drives to position, cuts PWM, leaves it limp — watch for creep. This is the passive-hold test the deep-sleep budget depends on. For MAIN (Ch20), hold-check · closed is also the MAIN_CLOSE_DEG seal check.</div>
+  <div class="warn">Hold-check drives to position, cuts PWM, leaves it limp — watch for creep. This is the passive-hold test the deep-sleep budget depends on. For COMMON (Ch20), hold-check &middot; closed is also the close-angle seal check.</div>
 </div>
 
 <hr class="sep"><h2>Mission</h2>
@@ -552,7 +553,7 @@ function poll(){fetch('/status').then(r=>r.json()).then(d=>{
   const test=!!d.test;document.getElementById('tm-panel').style.display=test?'block':'none';
   const tb=document.getElementById('tm-btn');tb.textContent=test?'Exit Testing Mode':'Enter Testing Mode';tb.className=test?'r':'b';
   if(d.close_offset)document.getElementById('offset-note').textContent=
-    'Sample valves: close = open +'+d.close_offset+'° · COMMON (Ch20): close = '+d.main_close+'° · common rests OPEN';
+    'Sample valves: close = open +'+d.close_offset+'° · COMMON (Ch20): close = open +'+d.main_offset+'° = '+d.main_close+'° · common rests OPEN';
   CHANNELS.forEach(ch=>{const c=document.getElementById('sc'+ch),p=document.getElementById('sp'+ch),s=d.servoStates[ch];
     c.className='sc'+(ch===20?' main-ch':'')+(s==='open'?' open':s==='close'?' closed':'');
     p.textContent=s==='open'?'OPEN':s==='close'?'CLOSED':s==='mid'?'MID':'--';});
@@ -588,7 +589,8 @@ void handleStatus() {
   json += "\"end_s\":"       + String(missionEndS())          + ",";
   json += "\"window_ms\":"   + String(winLeft)                + ",";
   json += "\"close_offset\":"+ String(CLOSE_OFFSET_DEG)       + ",";
-  json += "\"main_close\":"  + String(MAIN_CLOSE_DEG)         + ",";
+  json += "\"main_close\":"  + String(closeDegFor(MAIN_SERVO_CH, CH_OPEN[MAIN_SERVO_CH])) + ",";
+  json += "\"main_offset\":" + String(MAIN_CLOSE_OFFSET_DEG)  + ",";
   json += "\"cutoff\":"      + String(VBATT_CUTOFF_V, 2)      + ",";
   json += "\"test\":"        + String(testMode ? 1 : 0)       + ",";
 #ifdef MINI_DEPLOY

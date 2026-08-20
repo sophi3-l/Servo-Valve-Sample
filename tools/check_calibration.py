@@ -16,8 +16,9 @@ calibration.h
      unit's angles),
   5. every SAMPLE channel (Ch0..19) reaches open + CLOSE_OFFSET_DEG without
      being clamped at 180,
-  6. MAIN_CLOSE_DEG is in range and is above every unit's Ch20 open angle
-     (otherwise the main valve would "close" by moving toward open).
+  6. the common valve's open + MAIN_CLOSE_OFFSET_DEG fits under
+     MAIN_CLOSE_MAX_DEG on every unit (a unit that clamps silently gets less
+     travel than the rest of the fleet).
 
 schedule.h
   7. SAMPLE_TIME_S has exactly one entry per sample valve,
@@ -60,7 +61,8 @@ def parse_calibration(path: str):
         "lander_count": find_int(src, "LANDER_COUNT", 4),
         "servo_min": find_int(src, "SERVO_MIN_DEG", 70),
         "close_offset": find_int(src, "CLOSE_OFFSET_DEG", 65),
-        "main_close": find_int(src, "MAIN_CLOSE_DEG"),
+        "main_offset": find_int(src, "MAIN_CLOSE_OFFSET_DEG"),
+        "main_max": find_int(src, "MAIN_CLOSE_MAX_DEG"),
         "main_ch": find_int(src, "MAIN_SERVO_CH", 20),
         "sample_count": find_int(src, "SAMPLE_SERVO_COUNT", 20),
     }
@@ -95,23 +97,33 @@ def check_calibration(path, errors, notes):
         for ch, v in enumerate(row):
             if not (floor <= v <= 180):
                 errors.append(f"unit {i} Ch{ch}: open angle {v} out of range [{floor}, 180]")
-            # Sample channels must not clamp; Ch20 uses MAIN_CLOSE_DEG instead.
+            # Sample channels must not clamp; Ch20 uses its own offset/cap.
             if ch < cfg["sample_count"] and v + cfg["close_offset"] > 180:
                 errors.append(
                     f"unit {i} Ch{ch}: open {v} + CLOSE_OFFSET_DEG {cfg['close_offset']} "
                     f"= {v + cfg['close_offset']} would clamp at 180")
 
-    mc = cfg["main_close"]
-    if mc is None:
-        errors.append("MAIN_CLOSE_DEG not found in calibration.h")
+    off, cap, mch = cfg["main_offset"], cfg["main_max"], cfg["main_ch"]
+    mains = []
+    if off is None or cap is None:
+        errors.append("MAIN_CLOSE_OFFSET_DEG / MAIN_CLOSE_MAX_DEG not found in calibration.h")
     else:
-        if not (floor <= mc <= 180):
-            errors.append(f"MAIN_CLOSE_DEG {mc} out of range [{floor}, 180]")
+        if not (floor <= cap < 180):
+            errors.append(f"MAIN_CLOSE_MAX_DEG {cap} must be in [{floor}, 180) — it is the "
+                          f"cushion that keeps the common valve off its mechanical stop")
+        if off <= 0:
+            errors.append("MAIN_CLOSE_OFFSET_DEG must be positive — the common valve closes "
+                          "by moving away from its open angle")
         for i, row in enumerate(rows, start=1):
-            if len(row) > cfg["main_ch"] and mc <= row[cfg["main_ch"]]:
+            if len(row) <= mch:
+                continue
+            o = row[mch]
+            if o + off > cap:
                 errors.append(
-                    f"unit {i}: MAIN_CLOSE_DEG {mc} <= Ch{cfg['main_ch']} open angle "
-                    f"{row[cfg['main_ch']]} — main valve would 'close' toward open")
+                    f"unit {i}: Ch{mch} open {o} + offset {off} = {o + off} exceeds "
+                    f"MAIN_CLOSE_MAX_DEG {cap} — that unit would clamp and get less travel "
+                    f"than the rest of the fleet. Lower the offset, or lower its open angle.")
+            mains.append((i, o, min(o + off, cap)))
 
     committed_rows = [(i + 1, rows[i]) for i in range(min(len(rows), len(committed))) if committed[i]]
     for a in range(len(committed_rows)):
@@ -126,7 +138,10 @@ def check_calibration(path, errors, notes):
         state = "committed" if committed[i] else "placeholder (not deployable)"
         notes.append(f"  unit {i+1}: {state}")
     notes.append(f"  sample close = open + {cfg['close_offset']}°   ·   "
-                 f"main (Ch{cfg['main_ch']}) close = {mc}°")
+                 f"common (Ch{mch}) close = open + {off}°, capped at {cap}°")
+    if mains:
+        notes.append("  common close per unit: " +
+                     ", ".join(f"u{i} {o}->{c}" for i, o, c in mains))
     return cfg
 
 

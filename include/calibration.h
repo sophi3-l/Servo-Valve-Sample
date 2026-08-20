@@ -51,18 +51,32 @@
 //      (Ch18-19), not 4; Ch16-17 turned out to have real angles.
 //
 //  CHANGES 2026-08-18b (main-valve stop margin + compile-time table check):
-//    • MAIN_CLOSE_DEG replaces the hardcoded 180 inside closeDegFor(). The
+//    • The main valve's close angle stops being a hardcoded 180 inside
+//      closeDegFor() (see the 2026-08-19 entry for where it ended up). The
 //      main valve was being commanded to the absolute end of the pulse range
 //      (180° = 512 counts = 2500 us), i.e. straight into the mechanical stop,
 //      on every close — twice per sample event plus every park. Backing it to
 //      a named constant gives a defined cushion instead of none, and makes the
 //      cushion a decision rather than a by-product of each servo's open trim.
-//      *** MAIN_CLOSE_DEG IS NOT YET BENCH-CONFIRMED — see the note on it. ***
+//      *** THE COMMON VALVE'S CLOSE ANGLE IS NOT YET BENCH-CONFIRMED. ***
 //    • static_assert block added at the bottom of this file. tools/
 //      check_calibration.py only runs in CI, and firmware is routinely flashed
 //      offline from a locally-edited copy of this header, so a bad table could
 //      reach a board without ever passing the lint. These asserts make the
 //      same class of mistake a compile error instead.
+//
+//  CHANGES 2026-08-19b (main valve back to an offset — Sophie/Howard):
+//    • MAIN_CLOSE_DEG (a fixed 175°) is replaced by MAIN_CLOSE_OFFSET_DEG (70°)
+//      with a MAIN_CLOSE_MAX_DEG (175°) ceiling. A pinch valve closes as a
+//      function of TRAVEL from its calibrated open position, and the open angle
+//      already absorbs each servo's horn offset — so a fixed absolute angle gave
+//      the fleet inconsistent travel (D/B 85°, C 75°, A 70°). The offset holds
+//      travel constant at 70° on every unit; the cap protects the stop.
+//    • 70 is the largest offset available: Lander A's Ch20 opens at 105°, so at
+//      offset 75 it would land exactly on 180 — the mechanical stop. If a unit
+//      needs more than 70° of travel, its Ch20 OPEN angle must come down first.
+//    • _calMainCloseFits() fails the build if any unit would clamp, because a
+//      clamped unit silently gets less travel than the rest of the fleet.
 // =============================================================================
 
 // ---- I2C + PCA9685 boards ---------------------------------------------------
@@ -99,9 +113,9 @@ constexpr uint8_t SERVO_CHANNELS[SAMPLE_SERVO_COUNT] =
 //  180: the highest committed open angle is 115° (Lander D Ch13, Lander C
 //  Ch10), so 115 + 65 = 180 exactly — that's the binding case setting this
 //  ceiling. Ch20 (MAIN_SERVO_CH) does NOT use this formula: the main valve
-//  closes to MAIN_CLOSE_DEG regardless of its open angle — mechanically it's
-//  a different animal (near-full travel = fully closed) from the sample
-//  valves.
+//  uses its own, larger offset (MAIN_CLOSE_OFFSET_DEG, capped at
+//  MAIN_CLOSE_MAX_DEG) — mechanically it needs more travel to seal than a
+//  sample valve does.
 //
 //  WORKFLOW per unit:  `setid <n>` on the calibrate build (stamps NVS) →
 //  calibrate the 21 servos → paste that unit's open angles into row (n-1)
@@ -120,36 +134,50 @@ constexpr uint8_t SERVO_CHANNELS[SAMPLE_SERVO_COUNT] =
 constexpr uint8_t CLOSE_OFFSET_DEG = 65;     // !! MAX 65 — 115° hits 180 !!
 constexpr uint8_t LANDER_COUNT     = 4;
 
-//  Closed angle for the MAIN/common valve (Ch20) only. Sample valves are
-//  unaffected by this and still use open + CLOSE_OFFSET_DEG.
+//  ---- MAIN / COMMON valve (Ch20) close angle --------------------------------
+//  Ch20 closes at open + MAIN_CLOSE_OFFSET_DEG, capped at MAIN_CLOSE_MAX_DEG.
+//  Sample valves are unaffected and still use open + CLOSE_OFFSET_DEG.
 //
-//  *** NOT YET BENCH-CONFIRMED. Starting value only. ***
+//  *** NOT YET BENCH-CONFIRMED. Starting values only. ***
 //
-//  Why this exists: 180° is the absolute end of the commanded pulse range
-//  (degToPulse(180) = PULSE_MAX_COUNT = 512 = 2500 us), so closing the main
-//  valve to 180 drives it into the servo's mechanical stop every time. The
-//  low end already has a guard (SERVO_MIN_DEG = 70; commanding below it is
-//  what stalled Ch20/Ch14 on the bench) — the high end had none.
+//  WHY AN OFFSET AND NOT A FIXED ANGLE (changed 2026-08-19, Sophie/Howard):
+//  A pinch valve closes as a function of how far the horn TRAVELS from its
+//  calibrated open position — the open angle already absorbs each servo's horn
+//  offset, so travel-from-open is the meaningful quantity and absolute angle is
+//  not. This was previously a fixed 175°, which gave inconsistent travel across
+//  the fleet (D and B 85°, C 75°, A 70°). An offset holds travel constant and
+//  lets the cushion vary, which is the right way round: sealing depends on
+//  travel, and the cap below is what protects the stop.
 //
-//  175 is a starting value giving a 5° cushion off the stop. It must be
-//  confirmed per unit during the Section 14 cold/oil test at ~8 °C: drive the
-//  main valve to MAIN_CLOSE_DEG, cut PWM, and verify it is FULLY SEALED and
-//  does not creep. If a unit needs more travel to seal, raise this; if the
-//  four units disagree, convert this to a per-lander row indexed [unitID-1]
-//  exactly like CH_OPEN_DEG_ALL and add a closeDegFor() lookup.
+//  WHY 70 AND NOT MORE: the fleet ceiling is set by the highest Ch20 open angle,
+//  which is Lander A at 105°. At offset 75, A would land on 180 — the absolute
+//  end of the pulse range (degToPulse(180) = PULSE_MAX_COUNT = 512 = 2500 us),
+//  i.e. driven into the servo's mechanical stop on every close. 70 is the
+//  largest offset that keeps every committed unit at least 5° clear of it.
+//  The low end has had a guard for a while (SERVO_MIN_DEG = 70; commanding
+//  below it is what stalled Ch20/Ch14 on the bench); this is the high-end one.
 //
-//  Two things make this cushion matter more than it looks:
+//  At offset 45:  D 90->135   A 105->150   B 90->135   C 100->145
+//
+//  BENCH TASK: confirm per unit during the Rev K Section 14 cold/oil test at
+//  ~8 °C — drive Ch20 to its close angle, cut PWM, verify FULLY SEALED and no
+//  creep. If a unit needs more travel than 70°, its Ch20 OPEN angle has to come
+//  down first (that is what frees up headroom), or this becomes a per-lander
+//  row indexed [unitID-1] like CH_OPEN_DEG_ALL.
+//
+//  Two things make the cushion matter more than it looks:
 //    • The pack is 6 V nominal (2x PS-6100 in parallel) and the HPS-2018 is
 //      rated 6.0-8.4 V, so the servos run at/below their minimum rating for
 //      most of the discharge — slower and weaker than the 0.20 s/60° @ 7.4 V
 //      datasheet figure.
 //    • The servos are submerged in oil at ~8 °C, which the datasheet figure
 //      does not account for at all.
-//  A servo that cannot finish its stroke inside SERVO_SETTLE_MS ends up both
+//  A servo that cannot finish its stroke inside STEP_SETTLE_MS ends up both
 //  under-travelled (no seal) AND stalled for the whole settle window. Stall
 //  current is 1.4-2.3 A per Hiwonder vs the ~0.227 A the 2-servo path is
 //  certified for.
-constexpr uint8_t MAIN_CLOSE_DEG = 175;
+constexpr uint8_t MAIN_CLOSE_OFFSET_DEG = 45;    // travel from open, per unit
+constexpr uint8_t MAIN_CLOSE_MAX_DEG    = 175;   // hard ceiling: 5° off the stop
 
 //  Rows are indexed [unitID - 1].  Unit IDs are 1..4  →  SSID LanderController1..4
 constexpr uint8_t CH_OPEN_DEG_ALL[LANDER_COUNT][21] = {
@@ -201,10 +229,12 @@ inline bool calCommitted(uint8_t id) {
 // build (deploy's closeServo()/buildPulseTables(), the calibrate CLI's
 // `table` command). Sample valves (Ch0-19) close at open+CLOSE_OFFSET_DEG,
 // clamped to 180. The main valve (Ch20/MAIN_SERVO_CH) closes to
-// MAIN_CLOSE_DEG instead — it does not use the offset formula at all.
+// open + MAIN_CLOSE_OFFSET_DEG, capped at MAIN_CLOSE_MAX_DEG — a larger offset
+// than the sample valves, and its own ceiling.
 // Do not reimplement this inline anywhere else.
 inline uint8_t closeDegFor(uint8_t ch, uint8_t openDeg) {
-  if (ch == MAIN_SERVO_CH) return MAIN_CLOSE_DEG;
+  if (ch == MAIN_SERVO_CH)
+    return (uint8_t)min((int)openDeg + MAIN_CLOSE_OFFSET_DEG, (int)MAIN_CLOSE_MAX_DEG);
   return (uint8_t)min((int)openDeg + CLOSE_OFFSET_DEG, 180);
 }
 
@@ -327,7 +357,8 @@ constexpr bool _calRowOpenOk(uint8_t r, uint8_t i = 0) {
                    : (_calAngleOk(CH_OPEN_DEG_ALL[r][i]) && _calRowOpenOk(r, i + 1));
 }
 // Every SAMPLE channel (Ch0..19) reaches open+CLOSE_OFFSET_DEG without being
-// clamped at 180. Ch20 is excluded — it uses MAIN_CLOSE_DEG, not the offset.
+// clamped at 180. Ch20 is excluded — it has its own offset and cap, checked
+// separately by _calMainCloseFits().
 // This is the check that would have caught a pasted open angle above 115°.
 constexpr bool _calRowCloseOk(uint8_t r, uint8_t i = 0) {
   return (i >= SAMPLE_SERVO_COUNT)
@@ -338,22 +369,31 @@ constexpr bool _calAllRowsOk(uint8_t r = 0) {
   return (r >= LANDER_COUNT) ? true
                              : (_calRowOpenOk(r) && _calRowCloseOk(r) && _calAllRowsOk(r + 1));
 }
-// The main valve must CLOSE toward 180 from its open angle on every unit.
-constexpr bool _calMainClosesUpward(uint8_t r = 0) {
+// The main valve's full offset must fit under the ceiling on EVERY unit. If it
+// clamps, that unit silently gets less travel than the others — which is
+// exactly the inconsistency the offset was adopted to remove. Fleet ceiling is
+// set by the highest Ch20 open angle (Lander A at 105°).
+constexpr bool _calMainCloseFits(uint8_t r = 0) {
   return (r >= LANDER_COUNT)
            ? true
-           : ((MAIN_CLOSE_DEG > CH_OPEN_DEG_ALL[r][MAIN_SERVO_CH]) && _calMainClosesUpward(r + 1));
+           : ((CH_OPEN_DEG_ALL[r][MAIN_SERVO_CH] + MAIN_CLOSE_OFFSET_DEG <= MAIN_CLOSE_MAX_DEG)
+              && _calMainCloseFits(r + 1));
 }
 
 static_assert(_calAllRowsOk(),
               "calibration.h: an open angle is outside [SERVO_MIN_DEG,180], or a sample "
               "channel's open+CLOSE_OFFSET_DEG would clamp at 180. Fix CH_OPEN_DEG_ALL "
               "or lower CLOSE_OFFSET_DEG.");
-static_assert(_calAngleOk(MAIN_CLOSE_DEG),
-              "calibration.h: MAIN_CLOSE_DEG is outside [SERVO_MIN_DEG,180].");
-static_assert(_calMainClosesUpward(),
-              "calibration.h: MAIN_CLOSE_DEG is at or below some unit's Ch20 open angle — "
-              "the main valve would 'close' by moving toward open.");
+static_assert(_calAngleOk(MAIN_CLOSE_MAX_DEG) && MAIN_CLOSE_MAX_DEG < 180,
+              "calibration.h: MAIN_CLOSE_MAX_DEG must be inside [SERVO_MIN_DEG,180) — it is "
+              "the cushion that keeps the common valve off its mechanical stop.");
+static_assert(MAIN_CLOSE_OFFSET_DEG > 0,
+              "calibration.h: MAIN_CLOSE_OFFSET_DEG must be positive — the common valve "
+              "closes by moving AWAY from its open angle.");
+static_assert(_calMainCloseFits(),
+              "calibration.h: some unit's Ch20 open + MAIN_CLOSE_OFFSET_DEG exceeds "
+              "MAIN_CLOSE_MAX_DEG, so that unit would clamp and get less travel than the "
+              "rest of the fleet. Lower the offset, or lower that unit's Ch20 open angle.");
 static_assert(MAIN_SERVO_CH == SAMPLE_SERVO_COUNT,
               "calibration.h: MAIN_SERVO_CH must sit immediately above the sample channels; "
               "buildPulseTables() and the park routines iterate 0..MAIN_SERVO_CH.");

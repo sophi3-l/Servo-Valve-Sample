@@ -77,10 +77,12 @@ Closed angles come from one shared helper, `closeDegFor(ch, openDeg)`:
 - **Sample valves (Ch0–19)** close at `open + CLOSE_OFFSET_DEG` (65°). 65 is the
   ceiling: the highest committed open angle is 115° (D Ch13, C Ch10), and
   115 + 65 = 180 exactly.
-- **Common valve (Ch20)** closes at `MAIN_CLOSE_DEG` (175°) and does not use the
-  offset at all. It previously used a hardcoded 180 — the absolute end of the
-  pulse range, i.e. straight into the servo's mechanical stop, twice per sample
-  event. 175 gives a 5° cushion and is **not yet bench-confirmed.**
+- **Common valve (Ch20)** closes at `open + MAIN_CLOSE_OFFSET_DEG` (45°), capped
+  at `MAIN_CLOSE_MAX_DEG` (175°). An offset rather than a fixed angle, because a
+  pinch valve closes as a function of *travel from its calibrated open position* —
+  a fixed angle gave the fleet inconsistent travel (70–85°). 70 is the largest
+  offset that keeps every unit clear of the 180° mechanical stop; Lander A's Ch20
+  opens at 105°, which sets that ceiling. **Not yet bench-confirmed.**
 
 `SERVO_MIN_DEG` (70°) is the mechanical floor; the calibrate CLI refuses below it.
 
@@ -273,7 +275,7 @@ state `COMPLETE` and a **Restart from t=0** button. No flash erase needed.
 3. `pio run -e deploy -t upload`. **Confirm the SSID has no `-TEST` suffix.**
 4. Bench check on the deploy build: power up battery-disconnected, abort during
    the boot window, connect the PSU/battery, use Testing Mode for hold-checks
-   (for Ch20, "Hold-check · closed" is the `MAIN_CLOSE_DEG` seal test), then
+   (for Ch20, "Hold-check · closed" is the close-angle seal test), then
    "Set resting state".
 5. On deck: charge, remove the charge plug, record pack voltage, install the
    deployment plug, **watch for the 45 s LED blink**, then use the 5 min service
@@ -286,8 +288,8 @@ state `COMPLETE` and a **Restart from t=0** button. No flash erase needed.
 `.github/workflows/calibration-check.yml` runs on every push/PR:
 
 - **calibration-lint** — `tools/check_calibration.py` checks row shape and count,
-  angle ranges, that no sample channel's close angle clamps, that `MAIN_CLOSE_DEG`
-  is in range and above every unit's Ch20 open angle, that no two *committed* rows
+  angle ranges, that no sample channel's close angle clamps, that every unit's
+  Ch20 open + `MAIN_CLOSE_OFFSET_DEG` fits under `MAIN_CLOSE_MAX_DEG`, that no two *committed* rows
   are identical, and that the sample schedule is strictly increasing with no two
   events closer than the routine takes to run.
 - **build** — `pio run -e calibrate -e deploy -e minideploy`. This also exercises
@@ -323,7 +325,7 @@ Three numbers in this repo are placeholders that look like decisions:
 
 | Item | Where | Needs |
 |---|---|---|
-| `MAIN_CLOSE_DEG = 175` | `calibration.h` | Cold/oil seal check at ~8 °C, per unit — does the common valve fully seal, and does it creep? |
+| `MAIN_CLOSE_OFFSET_DEG = 45` | `calibration.h` | Cold/oil seal check at ~8 °C, per unit — does the common valve fully seal at 45° of travel, and does it creep? |
 | `VBATT_CUTOFF_V = 5.60` | `src/deploy/main.cpp` | 8 °C discharge test with the real load (Rev K Section 15 item 2). Must leave enough charge to finish. |
 | Passive hold | all channels | Hold-check per channel, open and closed |
 | `STEP_SETTLE_MS = 1000` | `schedule.h` | Stroke re-timed in oil at ~8 °C. Set from a 0.75 s bench measurement in air at room temperature — flight conditions are all slower. |

@@ -47,14 +47,14 @@
 //      Ch20 (main), which does not use the offset formula at all.
 //
 //  CHANGES 2026-08-18b (main-valve stop margin):
-//    • Ch20's close angle is now MAIN_CLOSE_DEG (calibration.h), not 180.
+//    • Ch20's close angle is no longer a hardcoded 180 (calibration.h).
 //      No change needed in this file — `table` already routes through
 //      closeDegFor() — but note that `table` is now the fastest way to check
 //      what the flight build will actually drive on the main valve.
-//    • BENCH TASK: MAIN_CLOSE_DEG is a starting value, not a confirmed one.
-//      Use `20 <MAIN_CLOSE_DEG>` then `r 20` here to drive the main valve to
-//      the candidate close angle and cut PWM, and confirm it seals fully and
-//      does not creep — at ~8 °C in oil, on each unit.
+//    • BENCH TASK: the common valve's close angle is a starting value, not a
+//      confirmed one. Run `table` to see what this unit will actually drive on
+//      Ch20, then `20 <that angle>` and `r 20` to drive it and cut PWM, and
+//      confirm it seals fully and does not creep — at ~8 °C in oil, per unit.
 //
 //  CHANGES 2026-08-19 (resting state moved here — Howard):
 //    • New `rest` command. The mission's resting state (Ch0-19 closed, Ch20
@@ -281,7 +281,7 @@ void loop() {
     Serial.println("ch | open deg/pulse | close deg/pulse");
     for (uint8_t i = 0; i <= 20; i++) {
       uint8_t o = show[i];
-      uint8_t c = closeDegFor(i, o);   // Ch20 (main) uses MAIN_CLOSE_DEG
+      uint8_t c = closeDegFor(i, o);   // Ch20 (main) uses open + MAIN_CLOSE_OFFSET_DEG
       Serial.printf("%2u |   %3u / %4u   |   %3u / %4u%s\n",
                     i, o, degToPulse(o), c, degToPulse(c),
                     i == MAIN_SERVO_CH ? "   (MAIN)" : "");
