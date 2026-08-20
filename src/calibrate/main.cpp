@@ -26,6 +26,7 @@
 //     <ch> <deg>    move (guarded, 70–180°)     e.g.  0 95   ·   16 110
 //     r <ch>        release → limp              e.g.  r 0
 //     off           release ALL + rail OFF
+//     railup        rail ON with all 21 preloaded to resting (safe cold start)
 //     rail          rail ON, no PWM (Q2 gate table HIGH row)
 //     cycle [ms]    rail OFF, wait, rail ON (default 2000 ms)
 //     active        list driven channels + count
@@ -99,7 +100,10 @@ void moveChannel(uint8_t ch, uint8_t deg) {
     Serial.println("). Release one first:  r <ch>");
     return;
   }
-  railUpAllCommanded();                             // never energise uncommanded
+  if (!railIsOn()) {
+    Serial.println("[WARN] cold rail-up: uncommanded servos will centre (~90 deg = OPEN).");
+    Serial.println("       Run `railup` first if you want all 21 held at resting.");
+  }
   uint16_t pulse = degToPulse(deg);
   applyPWM(ch, pulse);                              // signal first...
   servoMarkActive(ch, true);
@@ -168,6 +172,7 @@ void printHelp() {
   Serial.println("  <ch> <deg>   move (70-180 deg, max 2 active)   e.g. 0 95");
   Serial.println("  r <ch>       release channel (limp)");
   Serial.println("  off          release ALL + servo rail OFF");
+  Serial.println("  railup       rail ON with all 21 held at resting (safe cold start)");
   Serial.println("  rail         rail ON, no PWM  (Q2 gate-table HIGH row)");
   Serial.println("  cycle [ms]   rail OFF, wait, rail ON  (default 2000)");
   Serial.println("  active       list driven channels");
@@ -225,6 +230,14 @@ void loop() {
   }
 
   // Rail on with zero PWM — the GPIO25 HIGH row of Howard's gate table
+  // Rail up with all 21 held at resting — the safe way to energise from cold.
+  if (input == "railup") {
+    if (railIsOn()) { Serial.println("Rail already ON."); return; }
+    railUpAllCommanded();
+    Serial.println("Rail ON, all 21 preloaded to resting then released.");
+    return;
+  }
+
   if (input == "rail") {
     Serial.println("[WARN] zero-PWM rail-up: uncommanded servos will centre (~90 deg = OPEN).");
     Serial.println("       This is the Q2 gate-table test. For normal work use a move command,");
