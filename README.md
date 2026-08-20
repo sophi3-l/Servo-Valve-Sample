@@ -78,11 +78,12 @@ Closed angles come from one shared helper, `closeDegFor(ch, openDeg)`:
   ceiling: the highest committed open angle is 115° (D Ch13, C Ch10), and
   115 + 65 = 180 exactly.
 - **Common valve (Ch20)** closes at `open + MAIN_CLOSE_OFFSET_DEG` (45°), capped
-  at `MAIN_CLOSE_MAX_DEG` (175°). An offset rather than a fixed angle, because a
-  pinch valve closes as a function of *travel from its calibrated open position* —
-  a fixed angle gave the fleet inconsistent travel (70–85°). 70 is the largest
-  offset that keeps every unit clear of the 180° mechanical stop; Lander A's Ch20
-  opens at 105°, which sets that ceiling. **Not yet bench-confirmed.**
+  at `MAIN_CLOSE_MAX_DEG` (175°, inert at this offset). An offset rather than a
+  fixed angle, because a pinch valve closes as a function of *travel from its
+  calibrated open position* — a fixed angle gave the fleet inconsistent travel.
+  45° was measured on Lander A (Ch20 opens 105°, best close 150°). Per unit:
+  D 90→135, A 105→150, B 90→135, C 100→145. Note this is **less** travel than a
+  sample valve gets, not more. **Interim — a good seal, not a perfect one.**
 
 `SERVO_MIN_DEG` (70°) is the mechanical floor; the calibrate CLI refuses below it.
 
@@ -325,7 +326,7 @@ Three numbers in this repo are placeholders that look like decisions:
 
 | Item | Where | Needs |
 |---|---|---|
-| `MAIN_CLOSE_OFFSET_DEG = 45` | `calibration.h` | Cold/oil seal check at ~8 °C, per unit — does the common valve fully seal at 45° of travel, and does it creep? |
+| `MAIN_CLOSE_OFFSET_DEG = 45` | `calibration.h` | Measured on Lander A only. Spot-check D or B (they close at 135°, where a bad transfer shows first), then cold/oil seal check at ~8 °C per unit. |
 | `VBATT_CUTOFF_V = 5.60` | `src/deploy/main.cpp` | 8 °C discharge test with the real load (Rev K Section 15 item 2). Must leave enough charge to finish. |
 | Passive hold | all channels | Hold-check per channel, open and closed |
 | `STEP_SETTLE_MS = 1000` | `schedule.h` | Stroke re-timed in oil at ~8 °C. Set from a 0.75 s bench measurement in air at room temperature — flight conditions are all slower. |

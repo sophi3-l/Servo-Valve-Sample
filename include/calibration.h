@@ -66,17 +66,24 @@
 //      same class of mistake a compile error instead.
 //
 //  CHANGES 2026-08-19b (main valve back to an offset — Sophie/Howard):
-//    • MAIN_CLOSE_DEG (a fixed 175°) is replaced by MAIN_CLOSE_OFFSET_DEG (70°)
-//      with a MAIN_CLOSE_MAX_DEG (175°) ceiling. A pinch valve closes as a
-//      function of TRAVEL from its calibrated open position, and the open angle
-//      already absorbs each servo's horn offset — so a fixed absolute angle gave
-//      the fleet inconsistent travel (D/B 85°, C 75°, A 70°). The offset holds
-//      travel constant at 70° on every unit; the cap protects the stop.
-//    • 70 is the largest offset available: Lander A's Ch20 opens at 105°, so at
-//      offset 75 it would land exactly on 180 — the mechanical stop. If a unit
-//      needs more than 70° of travel, its Ch20 OPEN angle must come down first.
+//    • MAIN_CLOSE_DEG (a fixed 175°) is replaced by MAIN_CLOSE_OFFSET_DEG with a
+//      MAIN_CLOSE_MAX_DEG (175°) ceiling. A pinch valve closes as a function of
+//      TRAVEL from its calibrated open position, and the open angle already
+//      absorbs each servo's horn offset — so a fixed absolute angle gave the
+//      fleet inconsistent travel (D/B 85°, C 75°, A 70°). The offset holds
+//      travel constant on every unit; the cap protects the stop.
 //    • _calMainCloseFits() fails the build if any unit would clamp, because a
 //      clamped unit silently gets less travel than the rest of the fleet.
+//
+//  CHANGES 2026-08-19c (offset set from the bench — Sophie):
+//    • MAIN_CLOSE_OFFSET_DEG = 45, measured on Lander A: its Ch20 opens at 105°
+//      and its best close position is 150°. A is the unit with the furthest-
+//      forward visual zero, i.e. the highest Ch20 open angle in the fleet.
+//    • NOTE this is LESS travel than a sample valve gets (65°), which reverses
+//      the earlier assumption that the common valve needed near-full travel.
+//      That assumption came from an old comment, not from a measurement; the
+//      measurement wins. Comments that asserted it have been corrected.
+//    • Described as "not a perfect seal but a good one for now" — interim.
 // =============================================================================
 
 // ---- I2C + PCA9685 boards ---------------------------------------------------
@@ -113,9 +120,8 @@ constexpr uint8_t SERVO_CHANNELS[SAMPLE_SERVO_COUNT] =
 //  180: the highest committed open angle is 115° (Lander D Ch13, Lander C
 //  Ch10), so 115 + 65 = 180 exactly — that's the binding case setting this
 //  ceiling. Ch20 (MAIN_SERVO_CH) does NOT use this formula: the main valve
-//  uses its own, larger offset (MAIN_CLOSE_OFFSET_DEG, capped at
-//  MAIN_CLOSE_MAX_DEG) — mechanically it needs more travel to seal than a
-//  sample valve does.
+//  uses its own offset (MAIN_CLOSE_OFFSET_DEG, capped at MAIN_CLOSE_MAX_DEG).
+//  As measured it needs LESS travel than a sample valve, not more — 45° vs 65°.
 //
 //  WORKFLOW per unit:  `setid <n>` on the calibrate build (stamps NVS) →
 //  calibrate the 21 servos → paste that unit's open angles into row (n-1)
@@ -149,21 +155,30 @@ constexpr uint8_t LANDER_COUNT     = 4;
 //  lets the cushion vary, which is the right way round: sealing depends on
 //  travel, and the cap below is what protects the stop.
 //
-//  WHY 70 AND NOT MORE: the fleet ceiling is set by the highest Ch20 open angle,
-//  which is Lander A at 105°. At offset 75, A would land on 180 — the absolute
-//  end of the pulse range (degToPulse(180) = PULSE_MAX_COUNT = 512 = 2500 us),
-//  i.e. driven into the servo's mechanical stop on every close. 70 is the
-//  largest offset that keeps every committed unit at least 5° clear of it.
-//  The low end has had a guard for a while (SERVO_MIN_DEG = 70; commanding
-//  below it is what stalled Ch20/Ch14 on the bench); this is the high-end one.
+//  WHERE 45 CAME FROM: measured on Lander A, whose Ch20 opens at 105° and whose
+//  best close position is 150°. A has the furthest-forward visual zero, i.e. the
+//  highest Ch20 open angle in the fleet. Sophie's note: "might not be a perfect
+//  seal but it'll be a good one at least for now" — this is an interim value.
 //
 //  At offset 45:  D 90->135   A 105->150   B 90->135   C 100->145
+//  Closest approach to the 180° mechanical stop is A at 150 — 30° of cushion,
+//  so MAIN_CLOSE_MAX_DEG is inert at this offset and serves purely as a backstop
+//  if the offset is ever raised. The low end has had a guard for a while
+//  (SERVO_MIN_DEG = 70; commanding below it is what stalled Ch20/Ch14 on the
+//  bench) and 135 is well clear of that too.
+//
+//  THE ASSUMPTION THIS RESTS ON: that 45° of travel from open means the same
+//  physical motion on every unit — which holds only if "open" was calibrated to
+//  the same physical position (fully open, no strain) on all four. It was
+//  measured on A alone.
+//  SPOT-CHECK IT ON D OR B: they have the lowest Ch20 open angle (90°), so they
+//  close at 135° and are where a bad transfer would show up first as
+//  under-travel. Two minutes with `table` then `20 135` then `r 20`.
 //
 //  BENCH TASK: confirm per unit during the Rev K Section 14 cold/oil test at
-//  ~8 °C — drive Ch20 to its close angle, cut PWM, verify FULLY SEALED and no
-//  creep. If a unit needs more travel than 70°, its Ch20 OPEN angle has to come
-//  down first (that is what frees up headroom), or this becomes a per-lander
-//  row indexed [unitID-1] like CH_OPEN_DEG_ALL.
+//  ~8 °C — drive Ch20 to its close angle, cut PWM, verify sealed and no creep.
+//  If the four units disagree, this becomes a per-lander row indexed [unitID-1]
+//  like CH_OPEN_DEG_ALL.
 //
 //  Two things make the cushion matter more than it looks:
 //    • The pack is 6 V nominal (2x PS-6100 in parallel) and the HPS-2018 is
@@ -188,21 +203,12 @@ constexpr uint8_t CH_OPEN_DEG_ALL[LANDER_COUNT][21] = {
   // ── unit 2 · Lander A ──  bench-confirmed 2026-08-18
   {  95,  90,  90,  95, 100,  90,  85,  95,    // Ch0-7
     100, 100, 100,  90, 100,  95,  95, 105,    // Ch8-15
-   105, 100,  95,  95, 105 },                  // Ch16-20 (Ch20 = main)
+   105, 100,  95,  95, 100 },                  // Ch16-20 (Ch20 = main)
   // ── unit 3 · Lander B ──  bench-confirmed 2026-08-18
   {  95, 100, 100, 105, 100, 100,  95, 100,    // Ch0-7
    110,  95, 110,  90,  95, 105,  95, 100,     // Ch8-15
    100, 100, 110, 100,  90 },                  // Ch16-20 (Ch20 = main)
-  // ── unit 4 · Lander C ──  bench-confirmed 2026-08-18 — Ch18-19 PLACEHOLDER
-  //    Servos on Ch18-19 are burnt out / missing on this physical unit. The
-  //    two values below (95, 90 — copied from Lander D) are NOT real bench
-  //    angles; they only exist so degToPulse()/buildPulseTables() never
-  //    operate on an uninitialized/garbage value. Per the team's call, the
-  //    firmware was NOT changed to skip these channels for C — those
-  //    physical ports must not be wired to real sample valves on this unit,
-  //    and C's mission will spend 2 of its 20 sample wake cycles opening/
-  //    closing dead or unconnected ports (harmless, just wasted cycles).
-  //    Ch0-17 and Ch20 (main) below ARE real bench-confirmed angles.
+  // ── unit 4 · Lander C ──  bench-confirmed 2026-08-18
   {  95, 100, 105, 100,  95, 100,  95, 100,    // Ch0-7 (real)
     95,  90, 115, 105, 105, 105, 100, 100,     // Ch8-15 (real)
    100, 105,  95,  90, 100 },                  // Ch16-17 real, Ch18-19 PLACEHOLDER, Ch20 real (main)
@@ -229,8 +235,8 @@ inline bool calCommitted(uint8_t id) {
 // build (deploy's closeServo()/buildPulseTables(), the calibrate CLI's
 // `table` command). Sample valves (Ch0-19) close at open+CLOSE_OFFSET_DEG,
 // clamped to 180. The main valve (Ch20/MAIN_SERVO_CH) closes to
-// open + MAIN_CLOSE_OFFSET_DEG, capped at MAIN_CLOSE_MAX_DEG — a larger offset
-// than the sample valves, and its own ceiling.
+// open + MAIN_CLOSE_OFFSET_DEG, capped at MAIN_CLOSE_MAX_DEG — its own offset
+// and its own ceiling, independent of the sample valves'.
 // Do not reimplement this inline anywhere else.
 inline uint8_t closeDegFor(uint8_t ch, uint8_t openDeg) {
   if (ch == MAIN_SERVO_CH)
