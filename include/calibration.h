@@ -39,14 +39,14 @@ constexpr uint8_t SERVO_CHANNELS[SAMPLE_SERVO_COUNT] =
 //  open angles into row (n-1) -> CAL_COMMITTED[n-1] = true -> commit -> flash.
 //
 //  Sample valves (Ch0-19) close at open + CLOSE_OFFSET_DEG, clamped to 180.
-//  65 is the ceiling: highest committed open angle is 115, and 115+65 = 180.
+//  45 is the ceiling: highest committed open angle is 115, and 115+45 = 160.
 //  Ch20 (common) uses its own offset — see MAIN_CLOSE_OFFSET_DEG.
 //
 //  LABELING: the bench calls these Landers A/B/C/D; the firmware only knows
 //  1-4. Nothing enforces the mapping — update this comment if a unit is
 //  relabelled.
 //    unit 1 = D    unit 2 = A    unit 3 = B    unit 4 = C
-constexpr uint8_t CLOSE_OFFSET_DEG = 55;     // !! MAX 65 — 115° hits 180 !!
+constexpr uint8_t CLOSE_OFFSET_DEG = 60;     // !! MAX 65 — 115° hits 180 !!
 constexpr uint8_t LANDER_COUNT     = 4;
 
 //  ---- Common valve (Ch20) close angle ---------------------------------------
@@ -67,7 +67,7 @@ constexpr uint8_t LANDER_COUNT     = 4;
 //  holds only if "open" was calibrated to the same physical position on all
 //  four. Measured on A alone — spot-check D or B (lowest open angle, so a bad
 //  transfer shows there first). Confirm sealed + no creep at ~8 degC in oil.
-constexpr uint8_t MAIN_CLOSE_OFFSET_DEG = 45;    // travel from open, per unit
+constexpr uint8_t MAIN_CLOSE_OFFSET_DEG = 55;    // travel from open, per unit
 constexpr uint8_t MAIN_CLOSE_MAX_DEG    = 175;   // hard ceiling: 5° off the stop
 
 //  Rows are indexed [unitID - 1].  Unit IDs are 1..4  →  SSID LanderController1..4
@@ -77,13 +77,13 @@ constexpr uint8_t CH_OPEN_DEG_ALL[LANDER_COUNT][21] = {
      95, 105, 100, 105,  95, 115, 110,  95,    // Ch8-15
     100,  95,  95,  90,  90 },                 // Ch16-20 (Ch20 = main)
   // ── unit 2 · Lander A ──  bench-confirmed 2026-08-18
-  {  95,  90,  90,  95, 100,  90,  85,  95,    // Ch0-7
-    100, 100, 100,  90, 100,  95,  95, 105,    // Ch8-15
-   105, 100,  95,  95, 105 },                  // Ch16-20 (Ch20 = main)
+  {  95,  90,  90,  95, 95,  90,  90,  90,    // Ch0-7
+    90, 90, 90,  90, 90,  90,  90, 100,    // Ch8-15
+  95, 90,  90,  100, 90 },                  // Ch16-20 (Ch20 = main)
   // ── unit 3 · Lander B ──  bench-confirmed 2026-08-18
   {  95, 100, 100, 105, 100, 100,  95, 100,    // Ch0-7
    110,  95, 110,  90,  95, 105,  95, 100,     // Ch8-15
-   100, 100, 110, 100,  90 },                  // Ch16-20 (Ch20 = main)
+   100, 95, 110, 110,  90 },                   // Ch16-20 (Ch20 = main)
   // ── unit 4 · Lander C ──  bench-confirmed 2026-08-18 — Ch18-19 PLACEHOLDER
   //    Servos on Ch18-19 are burnt out / missing on this physical unit. The
   //    two values below (95, 90 — copied from Lander D) are NOT real bench
@@ -94,9 +94,9 @@ constexpr uint8_t CH_OPEN_DEG_ALL[LANDER_COUNT][21] = {
   //    and C's mission will spend 2 of its 20 sample wake cycles opening/
   //    closing dead or unconnected ports (harmless, just wasted cycles).
   //    Ch0-17 and Ch20 (main) below ARE real bench-confirmed angles.
-  {  95, 100, 105, 100,  95, 100,  95, 100,    // Ch0-7 (real)
-    95,  90, 115, 105, 105, 105, 100, 100,     // Ch8-15 (real)
-   100, 105,  95,  90, 100 },                  // Ch16-17 real, Ch18-19 PLACEHOLDER, Ch20 real (main)
+  {  95, 100, 105, 95,  100, 100,  100, 100,    // Ch0-7 (real)
+    110,  100, 115, 105, 105, 105, 100, 100,     // Ch8-15 (real)
+   95, 105,  105,  100, 90 },                  // Ch16-17 real, Ch18-19 PLACEHOLDER, Ch20 real (main)
 };
 
 //  Flip a row's flag to true ONLY after that physical unit's angles are
