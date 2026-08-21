@@ -46,7 +46,7 @@ constexpr uint8_t SERVO_CHANNELS[SAMPLE_SERVO_COUNT] =
 //  1-4. Nothing enforces the mapping — update this comment if a unit is
 //  relabelled.
 //    unit 1 = D    unit 2 = A    unit 3 = B    unit 4 = C
-constexpr uint8_t CLOSE_OFFSET_DEG = 65;     // !! MAX 65 — 115° hits 180 !!
+constexpr uint8_t CLOSE_OFFSET_DEG = 55;     // !! MAX 65 — 115° hits 180 !!
 constexpr uint8_t LANDER_COUNT     = 4;
 
 //  ---- Common valve (Ch20) close angle ---------------------------------------
