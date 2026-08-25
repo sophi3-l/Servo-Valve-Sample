@@ -324,6 +324,11 @@ void loop() {
     if (row) Serial.printf("Open/close map for Lander %u (cal %s):\n",
                            id, calCommitted(id) ? "committed" : "PLACEHOLDER");
     else     Serial.println("No unit ID stamped — showing Lander 1 row for reference:");
+    const uint8_t* ord = sampleOrderRow(id);
+    Serial.print("mission order (event 1-20 -> Ch):");
+    for (uint8_t i = 0; i < SAMPLE_SERVO_COUNT; i++)
+      Serial.printf(" %u", ord ? ord[i] : SAMPLE_ORDER_ALL[0][i]);
+    Serial.println(ord ? "" : "   (no ID — unit 1's order)");
     Serial.println("ch | open deg/pulse | close deg/pulse");
     for (uint8_t i = 0; i <= 20; i++) {
       uint8_t o = show[i];

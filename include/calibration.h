@@ -25,10 +25,50 @@ inline uint16_t degToPulse(uint8_t deg) {
 }
 
 // ---- Valve channel layout ---------------------------------------------------
+//  Declared here because SAMPLE_ORDER_ALL below needs the bound; the
+//  authoritative LANDER_COUNT sits with the calibration table and is
+//  static_asserted equal to it.
+constexpr uint8_t LANDER_COUNT_FWD   = 4;
 constexpr uint8_t MAIN_SERVO_CH      = 20;   // main intake valve
 constexpr uint8_t SAMPLE_SERVO_COUNT = 20;   // sample valves = Ch0..19
+//  The SET of sample channels, ascending. Use this wherever every sample valve
+//  must be touched and the order does not matter (e.g. the calibrate build's
+//  `rest` sweep). It is NOT the mission order — see SAMPLE_ORDER_ALL.
 constexpr uint8_t SERVO_CHANNELS[SAMPLE_SERVO_COUNT] =
   {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19};
+
+// ---- Mission sampling ORDER — PER LANDER ------------------------------------
+//  Which physical valve each scheduled event drives. Event i of the schedule
+//  drives SAMPLE_ORDER_ALL[unitID-1][i]. The TIMES are fixed by schedule.h and
+//  are the same on every unit; this table decides which valve gets which
+//  timepoint, and it differs per unit because the manifolds are not all
+//  plumbed the same way round.
+//
+//  Every row must be a permutation of 0..SAMPLE_SERVO_COUNT-1 — each sample
+//  valve used exactly once. _calOrderAllOk() fails the BUILD otherwise, which
+//  is the check that catches a duplicated channel (one valve sampled twice,
+//  another never opened — invisible at runtime on open-loop servos).
+//
+//  Angles are NOT reordered with this: CH_OPEN_DEG_ALL stays indexed by
+//  physical channel, so a channel keeps its own calibration wherever it lands
+//  in the order.
+//
+//  CHANGING AN ORDER MID-MISSION MIS-MAPS EVERYTHING. st.evtIdx is an event
+//  index, so a unit that has already taken samples would resume against the new
+//  order. Change these only pre-flight, and `clearmission` afterwards.
+constexpr uint8_t SAMPLE_ORDER_ALL[LANDER_COUNT_FWD][SAMPLE_SERVO_COUNT] = {
+  // unit 1 - Lander D : default, ascending
+  {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19},
+  // unit 2 - Lander A : default, ascending
+  {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19},
+  // unit 3 - Lander B : default, ascending
+  {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19},
+  // unit 4 - Lander C : back/front rows swapped 2026-08-25, so the back row
+  //   (Ch10-19) is sampled first and the front row (Ch0-9) second. Within the
+  //   back row Ch17 and Ch18 are also transposed - the two valves were fitted
+  //   the other way round. Ch19 keeps its place at the end of the back row.
+  {10,11,12,13,14,15,16,18,17,19, 0,1,2,3,4,5,6,7,8,9},
+};
 
 // ---- Per-lander calibration ------------------------------------------------
 //  Open angles are trimmed per servo (visual centre, ~90 deg) so they differ per
@@ -58,16 +98,16 @@ constexpr uint8_t LANDER_COUNT     = 4;
 //  from its calibrated open position, so a fixed angle gave the fleet
 //  inconsistent travel (70-85 deg).
 //
-//  Currently 55. The original 45 was measured on Lander A back when its Ch20
-//  opened at 105 (best close 150). BOTH of those inputs have since moved: the
-//  offset is 55, and every unit's Ch20 now opens at 90.
-//
-//  At 55:  D 90->145   A 90->145   B 90->145   C 90->145
-//
-//  All four Ch20 open angles are equal, so no single unit sets the fleet
-//  ceiling any more — every unit clears MAIN_CLOSE_MAX_DEG (175) by 30 deg.
+//  Currently 55. The original 45 was measured on Lander A (Ch20 open 105, best
+//  close 150). Both the offset and the open angles have moved several times
+//  since, so THIS COMMENT DELIBERATELY DOES NOT LIST PER-UNIT VALUES — they go
+//  stale. `python tools/check_calibration.py` prints the live figures
+//  ("common close per unit"), and the calibrate CLI's `table` prints the
+//  stamped unit's. The invariant that matters is enforced, not remembered:
+//  _calMainCloseFits() fails the BUILD if any unit's Ch20 open + this offset
+//  exceeds MAIN_CLOSE_MAX_DEG.
 //  INTERIM: "a good seal, not a perfect one". Still less travel than a sample
-//  valve (60 deg), which reverses an older assumption that the common valve
+//  valve gets, which reverses an older assumption that the common valve
 //  needed near-full travel.
 //
 //  Assumes 55 deg of travel is the same physical motion on every unit, which
@@ -122,6 +162,12 @@ inline const uint8_t* chOpenRow(uint8_t id) {
 }
 inline bool calCommitted(uint8_t id) {
   return (id >= 1 && id <= LANDER_COUNT) && CAL_COMMITTED[id - 1];
+}
+
+//  This unit's mission sampling order, or nullptr when the ID is unset/out of
+//  range — same fail-safe contract as chOpenRow().
+inline const uint8_t* sampleOrderRow(uint8_t id) {
+  return (id >= 1 && id <= LANDER_COUNT) ? SAMPLE_ORDER_ALL[id - 1] : nullptr;
 }
 
 // Closed-angle policy for a channel — THE single formula, shared by every
@@ -281,8 +327,8 @@ constexpr bool _calAllRowsOk(uint8_t r = 0) {
 // The main valve's full offset must fit under the ceiling on EVERY unit. If it
 // clamps, that unit silently gets less travel than the others — which is
 // exactly the inconsistency the offset was adopted to remove. The binding case
-// is whichever unit has the highest Ch20 open angle; all four currently open at
-// 90°, so the fleet clears MAIN_CLOSE_MAX_DEG by 30°.
+// is whichever unit has the highest Ch20 open angle — run the lint to see which
+// that currently is, rather than trusting a number written here.
 constexpr bool _calMainCloseFits(uint8_t r = 0) {
   return (r >= LANDER_COUNT)
            ? true
@@ -304,6 +350,29 @@ static_assert(_calMainCloseFits(),
               "calibration.h: some unit's Ch20 open + MAIN_CLOSE_OFFSET_DEG exceeds "
               "MAIN_CLOSE_MAX_DEG, so that unit would clamp and get less travel than the "
               "rest of the fleet. Lower the offset, or lower that unit's Ch20 open angle.");
+// Every SAMPLE_ORDER_ALL row must be a permutation of 0..SAMPLE_SERVO_COUNT-1:
+// each sample valve used exactly once. A duplicate would sample one valve twice
+// and leave another shut for the whole mission, and with open-loop servos
+// nothing at runtime could tell. Recursive constexpr, C++11-safe.
+constexpr uint8_t _calOrderCount(uint8_t r, uint8_t c, uint8_t i = 0) {
+  return (i >= SAMPLE_SERVO_COUNT)
+           ? 0
+           : (uint8_t)((SAMPLE_ORDER_ALL[r][i] == c ? 1 : 0) + _calOrderCount(r, c, i + 1));
+}
+constexpr bool _calOrderRowOk(uint8_t r, uint8_t c = 0) {
+  return (c >= SAMPLE_SERVO_COUNT)
+           ? true
+           : (_calOrderCount(r, c) == 1 && _calOrderRowOk(r, c + 1));
+}
+constexpr bool _calOrderAllOk(uint8_t r = 0) {
+  return (r >= LANDER_COUNT) ? true : (_calOrderRowOk(r) && _calOrderAllOk(r + 1));
+}
+static_assert(_calOrderAllOk(),
+              "calibration.h: a SAMPLE_ORDER_ALL row is not a permutation of 0..19 — some "
+              "sample valve is used twice and another never opened. Fix the order table.");
+static_assert(LANDER_COUNT == LANDER_COUNT_FWD,
+              "calibration.h: LANDER_COUNT_FWD (the SAMPLE_ORDER_ALL bound) must match "
+              "LANDER_COUNT.");
 static_assert(MAIN_SERVO_CH == SAMPLE_SERVO_COUNT,
               "calibration.h: MAIN_SERVO_CH must sit immediately above the sample channels; "
               "buildPulseTables() and the park routines iterate 0..MAIN_SERVO_CH.");

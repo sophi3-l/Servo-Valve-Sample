@@ -142,7 +142,23 @@ UI shows `--` rather than asserting "CLOSED" for all 21.
 ## Event table
 
 Twenty events, one per sample valve, so the event index *is* the sample index.
-Event *i* drives `SERVO_CHANNELS[i]`.
+
+**Which valve event *i* drives is per-unit.** `SAMPLE_ORDER_ALL[unitID-1][i]` in
+`calibration.h` maps events to channels; the times below are identical on every
+lander, only the mapping differs. Units 1–3 (D, A, B) use the default ascending
+order. **Unit 4 (Lander C)** was re-plumbed on 2026-08-25 — its back and front
+rows were swapped, so it samples Ch10–19 first and Ch0–9 second, with Ch17 and
+Ch18 transposed within the back row:
+
+```
+10, 11, 12, 13, 14, 15, 16, 18, 17, 19,  0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+```
+
+Open angles are *not* reordered with it — `CH_OPEN_DEG_ALL` stays indexed by
+physical channel, so each channel keeps its own calibration wherever it falls in
+the order. Every row must be a permutation of 0–19; a `static_assert` and the
+lint both reject a duplicate, which would otherwise sample one valve twice and
+leave another shut for the whole mission.
 
 | # | Ch | t (s) | t | gap | Label |
 |---|---|---|---|---|---|

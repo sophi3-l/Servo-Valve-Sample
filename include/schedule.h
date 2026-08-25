@@ -76,9 +76,11 @@ constexpr uint32_t ROUTINE_S       = ROUTINE_MS / 1000;
 constexpr uint32_t SAMPLE_DWELL_MS = SAMPLE_OPEN_MS - STEP_SETTLE_MS;
 
 // ---- Absolute sample schedule (Sheet 1, seconds since power-on) -------------
-//  Event i drives SERVO_CHANNELS[i]; there are exactly SAMPLE_SERVO_COUNT of
-//  them, so the sample index IS the event index. No action column is needed —
-//  every event in this mission is a sample.
+//  There are exactly SAMPLE_SERVO_COUNT events, so the sample index IS the
+//  event index. No action column is needed — every event here is a sample.
+//  WHICH valve event i drives is per-unit: SAMPLE_ORDER_ALL[unitID-1][i] in
+//  calibration.h, not SERVO_CHANNELS[i]. The times below are identical on
+//  every lander; only the valve mapping differs.
 //
 //        t (s)      #   Ch          t           gap       label  increment
 constexpr uint8_t  EVENT_COUNT = SAMPLE_SERVO_COUNT;      // 20

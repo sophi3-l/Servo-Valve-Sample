@@ -102,7 +102,8 @@ constexpr uint32_t PRELOAD_S  = (PRELOAD_MS + 999) / 1000;
 // ── Per-unit identity ────────────────────────────────────────────────────────
 uint8_t         g_unitId = 0;
 bool            g_idOk   = false;
-const uint8_t*  CH_OPEN  = nullptr;
+const uint8_t*  CH_OPEN  = nullptr;   // this unit's open angles, indexed by CHANNEL
+const uint8_t*  SAMPLE_ORDER = nullptr;   // this unit's mission order, indexed by EVENT
 
 // ── Battery guard ────────────────────────────────────────────────────────────
 //  Pack is 2x Power-Sonic PS-6100 in PARALLEL: 6 V nominal, 24 Ah.
@@ -321,7 +322,7 @@ void restingStateSweep() {
 // offsets, so changing the settle CANNOT shift a command time: the sample valve
 // is open for 116 s and common is closed for 124 s at any settle value.
 void runSampleEvent(uint8_t idx) {
-  uint8_t ch = SERVO_CHANNELS[idx];
+  uint8_t ch = SAMPLE_ORDER[idx];        // per-unit order, NOT ascending channel
   Serial.printf("[EVENT] sample %u/%u  Ch%u  (t=%lu s, settle %u ms)\n",
                 idx + 1, EVENT_COUNT, ch, (unsigned long)missionElapsedS(), STEP_SETTLE_MS);
 
@@ -371,6 +372,8 @@ void loadUnitId() {
   const uint8_t* row = chOpenRow(g_unitId);
   g_idOk  = (row != nullptr) && calCommitted(g_unitId);
   CH_OPEN = row ? row : CH_OPEN_DEG_ALL[0];   // row-0 fallback keeps math safe
+  const uint8_t* ord = sampleOrderRow(g_unitId);
+  SAMPLE_ORDER = ord ? ord : SAMPLE_ORDER_ALL[0];   // same fail-safe fallback
 #ifdef MINI_DEPLOY
   const char* ssidTag = "-TEST";              // DO NOT SEAL
 #else
@@ -380,6 +383,11 @@ void loadUnitId() {
   else     snprintf(apSsid, sizeof(apSsid), "LanderController-UNSET%s", ssidTag);
   Serial.printf("[ID]    unit=%u  cal=%s  ssid=%s\n",
                 g_unitId, g_idOk ? "committed" : "MISSING/placeholder", apSsid);
+  // Print the mission order at every boot: it differs per unit, and the deck
+  // log is the only place an operator can confirm which valve samples first.
+  Serial.print("[ORDER] events 1-20 drive Ch:");
+  for (uint8_t i = 0; i < SAMPLE_SERVO_COUNT; i++) Serial.printf(" %u", SAMPLE_ORDER[i]);
+  Serial.println(ord ? "" : "   (NO UNIT ID — showing unit 1's order)");
 }
 
 // ── Sleep ────────────────────────────────────────────────────────────────────
@@ -604,7 +612,7 @@ void handleStatus() {
   json += "\"total\":"       + String(EVENT_COUNT)            + ",";
   json += "\"elapsed_s\":"   + String(elapsed)                + ",";
   json += "\"next_s\":"      + String(st.evtIdx < EVENT_COUNT ? eventTimeS(st.evtIdx) : 0) + ",";
-  json += "\"next_ch\":"     + String(st.evtIdx < EVENT_COUNT ? SERVO_CHANNELS[st.evtIdx] : 0) + ",";
+  json += "\"next_ch\":"     + String(st.evtIdx < EVENT_COUNT ? SAMPLE_ORDER[st.evtIdx] : 0) + ",";
   json += "\"end_s\":"       + String(missionEndS())          + ",";
   json += "\"window_ms\":"   + String(winLeft)                + ",";
   json += "\"close_offset\":"+ String(CLOSE_OFFSET_DEG)       + ",";
@@ -807,7 +815,7 @@ void runMissionWake(bool freshBoot, bool unexpectedReset) {
   while (st.evtIdx < EVENT_COUNT && missionElapsedS() >= eventTimeS(st.evtIdx)) {
     if (low) {
       Serial.printf("[WAKE]  SKIPPED sample %u/%u (Ch%u) — low battery\n",
-                    st.evtIdx + 1, EVENT_COUNT, SERVO_CHANNELS[st.evtIdx]);
+                    st.evtIdx + 1, EVENT_COUNT, SAMPLE_ORDER[st.evtIdx]);
     } else {
       runSampleEvent(st.evtIdx);
       ranEvent = true;

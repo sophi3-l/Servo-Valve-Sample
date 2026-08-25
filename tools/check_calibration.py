@@ -18,7 +18,10 @@ calibration.h
      being clamped at 180,
   6. the common valve's open + MAIN_CLOSE_OFFSET_DEG fits under
      MAIN_CLOSE_MAX_DEG on every unit (a unit that clamps silently gets less
-     travel than the rest of the fleet).
+     travel than the rest of the fleet),
+  6b. every SAMPLE_ORDER_ALL row is a permutation of 0..SAMPLE_SERVO_COUNT-1 —
+     each sample valve used exactly once (a duplicate samples one valve twice
+     and leaves another shut all mission; open-loop servos cannot report it).
 
 schedule.h
   7. SAMPLE_TIME_S has exactly one entry per sample valve,
@@ -73,16 +76,21 @@ def parse_calibration(path: str):
     rows = [[int(x) for x in re.findall(r"\d+", grp)]
             for grp in re.findall(r"\{([^{}]*)\}", body)]
 
+    order_body = find_array(src, "SAMPLE_ORDER_ALL", r"[^\]]*\]\s*\[[^\]]*\s*")
+    orders = ([[int(x) for x in re.findall(r"\d+", grp)]
+               for grp in re.findall(r"\{([^{}]*)\}", order_body)]
+              if order_body is not None else None)
+
     c = re.search(r"CAL_COMMITTED\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}", src, flags=re.S)
     if not c:
         raise SystemExit("FAIL: could not find CAL_COMMITTED[...] = { ... };")
     committed = [tok.strip() == "true" for tok in c.group(1).split(",") if tok.strip()]
 
-    return cfg, rows, committed
+    return cfg, rows, committed, orders
 
 
 def check_calibration(path, errors, notes):
-    cfg, rows, committed = parse_calibration(path)
+    cfg, rows, committed, orders = parse_calibration(path)
     n, floor = cfg["lander_count"], cfg["servo_min"]
 
     if len(rows) != n:
@@ -124,6 +132,30 @@ def check_calibration(path, errors, notes):
                     f"MAIN_CLOSE_MAX_DEG {cap} — that unit would clamp and get less travel "
                     f"than the rest of the fleet. Lower the offset, or lower its open angle.")
             mains.append((i, o, min(o + off, cap)))
+
+    ns = cfg["sample_count"]
+    if orders is None:
+        errors.append("could not find SAMPLE_ORDER_ALL[...][...] = { ... }; in calibration.h")
+    else:
+        if len(orders) != n:
+            errors.append(f"SAMPLE_ORDER_ALL has {len(orders)} rows, expected LANDER_COUNT={n}")
+        for i, o in enumerate(orders, start=1):
+            if len(o) != ns:
+                errors.append(f"unit {i}: sample order has {len(o)} entries, expected {ns}")
+                continue
+            if sorted(o) != list(range(ns)):
+                dupes = sorted({v for v in o if o.count(v) > 1})
+                missing = [v for v in range(ns) if v not in o]
+                bad = [v for v in o if v >= ns]
+                detail = []
+                if dupes:   detail.append("duplicated Ch" + ", Ch".join(str(v) for v in dupes))
+                if missing: detail.append("never sampled: Ch" + ", Ch".join(str(v) for v in missing))
+                if bad:     detail.append("out of range: " + ", ".join(str(v) for v in bad))
+                errors.append(f"unit {i}: sample order is not a permutation of 0..{ns - 1} "
+                              f"({'; '.join(detail)})")
+            elif o != list(range(ns)):
+                notes.append(f"  unit {i}: NON-DEFAULT sample order -> "
+                             + " ".join(str(v) for v in o))
 
     committed_rows = [(i + 1, rows[i]) for i in range(min(len(rows), len(committed))) if committed[i]]
     for a in range(len(committed_rows)):

@@ -75,16 +75,18 @@ comment in `calibration.h` and this table:
 Closed angles come from one shared helper, `closeDegFor(ch, openDeg)`:
 
 - **Sample valves (Ch0–19)** close at `open + CLOSE_OFFSET_DEG`, currently
-  **60°**. 65 is the arithmetic ceiling: the highest committed open angle is
-  115° (D Ch13) and 115 + 65 = 180 exactly. A `static_assert` fails the build if
-  any sample channel would clamp.
+  **60°**, clamped at 180°. A `static_assert` fails the build if any sample
+  channel would clamp, so the ceiling is enforced rather than remembered.
 - **Common valve (Ch20)** closes at `open + MAIN_CLOSE_OFFSET_DEG`, currently
-  **55°**, capped at `MAIN_CLOSE_MAX_DEG` (175°, inert at this offset). An offset
-  rather than a fixed angle, because a pinch valve closes as a function of
-  *travel from its calibrated open position* — a fixed angle gave the fleet
-  inconsistent travel. Every unit's Ch20 now opens at 90°, so the fleet is
-  uniform: **D, A, B, C all 90→145**. Note this is **less** travel than a sample
-  valve gets, not more. **Interim — a good seal, not a perfect one.**
+  **55°**, capped at `MAIN_CLOSE_MAX_DEG` (175°). An offset rather than a fixed
+  angle, because a pinch valve closes as a function of *travel from its
+  calibrated open position* — a fixed angle gave the fleet inconsistent travel.
+  Note this is **less** travel than a sample valve gets, not more.
+  **Interim — a good seal, not a perfect one.**
+
+Per-unit close angles are deliberately **not** listed here; they have gone stale
+every time an angle changed. Run `python tools/check_calibration.py` for the live
+values, or `table` on the calibrate build for the stamped unit.
 
 `SERVO_MIN_DEG` (70°) is the mechanical floor; the calibrate CLI refuses below it.
 
@@ -245,7 +247,7 @@ pio run -e calibrate -t upload
 #   serial @ 115200, newline ending:
 setid 2          # NUMBER, not letter:  D=1  A=2  B=3  C=4
 id               # confirm "Lander ID = 2 ... cal committed"
-table            # confirm Ch20 close shows 145 (open 90 + 55 offset)
+table            # confirm Ch20 close = its open angle + 55, and the mission order
 rest             # LAST STEP: Ch0-19 closed, Ch20 open (~61 s), then confirm by eye
 
 pio run -e minideploy -t upload
