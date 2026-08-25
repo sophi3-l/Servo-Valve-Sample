@@ -81,9 +81,9 @@ constexpr uint8_t CH_OPEN_DEG_ALL[LANDER_COUNT][21] = {
     90, 90, 90,  90, 90,  90,  90, 100,    // Ch8-15
   95, 90,  90,  100, 90 },                  // Ch16-20 (Ch20 = main)
   // ── unit 3 · Lander B ──  bench-confirmed 2026-08-18
-  {  95, 100, 100, 105, 100, 100,  95, 100,    // Ch0-7
-   110,  95, 110,  90,  95, 105,  95, 100,     // Ch8-15
-   100, 95, 110, 110,  90 },                   // Ch16-20 (Ch20 = main)
+  {  85, 80, 85, 85, 85, 85,  85, 85,    // Ch0-7
+   85,  85, 85,  85,  85, 85,  85, 85,     // Ch8-15
+   85, 85, 85, 85,  90 },                   // Ch16-20 (Ch20 = main)
   // ── unit 4 · Lander C ──  bench-confirmed 2026-08-18 — Ch18-19 PLACEHOLDER
   //    Servos on Ch18-19 are burnt out / missing on this physical unit. The
   //    two values below (95, 90 — copied from Lander D) are NOT real bench
