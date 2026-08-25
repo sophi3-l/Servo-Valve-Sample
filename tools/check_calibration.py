@@ -161,7 +161,7 @@ def check_schedule(path, cfg, errors, notes):
     if settle is not None and offs[3] is not None:
         routine = (offs[3] + settle) // 1000
     else:
-        routine = find_int(src, "ROUTINE_S", 126)
+        routine = find_int(src, "ROUTINE_S", 125)
 
     # The settle must fit inside every gap between protocol commands, or one
     # servo would still be powered when the next command is issued. And the two

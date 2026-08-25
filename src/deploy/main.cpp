@@ -52,6 +52,19 @@
 #define ARM_LED_PIN  LED_PIN
 #define SERVO_FREQ   SERVO_FREQ_HZ
 
+// Mission state (armed / done / evt / elapsed) lives in a PER-BUILD namespace,
+// because NVS survives a reflash and MINI_DEPLOY changes only timings. Sharing
+// one namespace meant a completed rehearsal made the flight build take the
+// st.complete branch on the deck: 45 s LED blink indistinguishable from a
+// healthy arm, then latchOff() — a unit dead on the seafloor. The unit ID stays
+// in "karen": it is a property of the board, not of the mission, and must
+// survive both builds. Use the calibrate CLI's `clearmission` to reset.
+#ifdef MINI_DEPLOY
+#define MISSION_NS "karen_m"
+#else
+#define MISSION_NS "karen_d"
+#endif
+
 // ── Network (service windows only — never up during a sleep) ─────────────────
 const char* AP_PASSWORD = "lander1234";
 char        apSsid[32]  = "LanderController-UNSET";
@@ -68,9 +81,12 @@ const uint32_t AP_BOOT_WINDOW_MS = 60000;   // 60 s — enough to join WiFi
 const uint32_t AP_WINDOW_MS      = 10000;   // 10 s between rehearsal events
 const uint32_t LED_CONFIRM_MS    = 8000;    // 8 s
 #else
-const uint32_t AP_BOOT_WINDOW_MS = 300000;  // 5 min — matches the protocol's
-                                            // 5 min deck allowance (the 3300 s
-                                            // offset between the two sheets)
+const uint32_t AP_BOOT_WINDOW_MS = 300000;  // 5 min — the protocol's deck
+                                            // allowance. It runs INSIDE the
+                                            // mission clock; SAMPLE_TIME_S
+                                            // already accounts for it. (Not to
+                                            // be confused with the 3300 s
+                                            // sheet-to-sheet offset = 55 min.)
 const uint32_t AP_WINDOW_MS      = 300000;  // 5 min after each sample event
 const uint32_t LED_CONFIRM_MS    = 45000;   // 45 s, per Rev K "30-60 s"
 #endif
@@ -331,7 +347,7 @@ void runSampleEvent(uint8_t idx) {
 // ── Persistence ──────────────────────────────────────────────────────────────
 void saveState(uint32_t elapsedS) {
   st.elapsedS = elapsedS;
-  prefs.begin("karen", false);
+  prefs.begin(MISSION_NS, false);
   prefs.putBool ("armed",   st.armed);
   prefs.putBool ("done",    st.complete);
   prefs.putUChar("evt",     st.evtIdx);
@@ -340,7 +356,7 @@ void saveState(uint32_t elapsedS) {
   rtcMagic = STATE_MAGIC; rtcElapsedS = st.elapsedS; rtcEvtIdx = st.evtIdx;
 }
 void loadState() {
-  prefs.begin("karen", true);
+  prefs.begin(MISSION_NS, true);
   st.armed    = prefs.getBool ("armed",   false);
   st.complete = prefs.getBool ("done",    false);
   st.evtIdx   = prefs.getUChar("evt",     0);

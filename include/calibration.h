@@ -39,14 +39,17 @@ constexpr uint8_t SERVO_CHANNELS[SAMPLE_SERVO_COUNT] =
 //  open angles into row (n-1) -> CAL_COMMITTED[n-1] = true -> commit -> flash.
 //
 //  Sample valves (Ch0-19) close at open + CLOSE_OFFSET_DEG, clamped to 180.
-//  45 is the ceiling: highest committed open angle is 115, and 115+45 = 160.
+//  65 is the arithmetic ceiling: the highest committed open angle is 115
+//  (Lander D, Ch13), and 115 + 65 = 180 exactly. The offset is currently 60.
+//  _calRowCloseOk() fails the BUILD if any sample channel would clamp, so the
+//  ceiling is enforced rather than remembered.
 //  Ch20 (common) uses its own offset — see MAIN_CLOSE_OFFSET_DEG.
 //
 //  LABELING: the bench calls these Landers A/B/C/D; the firmware only knows
 //  1-4. Nothing enforces the mapping — update this comment if a unit is
 //  relabelled.
 //    unit 1 = D    unit 2 = A    unit 3 = B    unit 4 = C
-constexpr uint8_t CLOSE_OFFSET_DEG = 60;     // !! MAX 65 — 115° hits 180 !!
+constexpr uint8_t CLOSE_OFFSET_DEG = 60;     // current 60 · hard max 65 (115+65=180)
 constexpr uint8_t LANDER_COUNT     = 4;
 
 //  ---- Common valve (Ch20) close angle ---------------------------------------
@@ -55,18 +58,21 @@ constexpr uint8_t LANDER_COUNT     = 4;
 //  from its calibrated open position, so a fixed angle gave the fleet
 //  inconsistent travel (70-85 deg).
 //
-//  45 measured on Lander A: Ch20 opens at 105, best close is 150. A has the
-//  highest Ch20 open angle in the fleet, so it sets the ceiling — at offset 75
-//  it would land on 180, the mechanical stop. INTERIM: "a good seal, not a
-//  perfect one". Less travel than a sample valve (65 deg), which reverses an
-//  older assumption that the common valve needed near-full travel.
+//  Currently 55. The original 45 was measured on Lander A back when its Ch20
+//  opened at 105 (best close 150). BOTH of those inputs have since moved: the
+//  offset is 55, and every unit's Ch20 now opens at 90.
 //
-//  At 45:  D 90->135   A 105->150   B 90->135   C 100->145
+//  At 55:  D 90->145   A 90->145   B 90->145   C 90->145
 //
-//  Assumes 45 deg of travel is the same physical motion on every unit, which
+//  All four Ch20 open angles are equal, so no single unit sets the fleet
+//  ceiling any more — every unit clears MAIN_CLOSE_MAX_DEG (175) by 30 deg.
+//  INTERIM: "a good seal, not a perfect one". Still less travel than a sample
+//  valve (60 deg), which reverses an older assumption that the common valve
+//  needed near-full travel.
+//
+//  Assumes 55 deg of travel is the same physical motion on every unit, which
 //  holds only if "open" was calibrated to the same physical position on all
-//  four. Measured on A alone — spot-check D or B (lowest open angle, so a bad
-//  transfer shows there first). Confirm sealed + no creep at ~8 degC in oil.
+//  four. Confirm sealed + no creep at ~8 degC in oil.
 constexpr uint8_t MAIN_CLOSE_OFFSET_DEG = 55;    // travel from open, per unit
 constexpr uint8_t MAIN_CLOSE_MAX_DEG    = 175;   // hard ceiling: 5° off the stop
 
@@ -78,34 +84,36 @@ constexpr uint8_t CH_OPEN_DEG_ALL[LANDER_COUNT][21] = {
     100,  95,  95,  90,  90 },                 // Ch16-20 (Ch20 = main)
   // ── unit 2 · Lander A ──  bench-confirmed 2026-08-18
   {  95,  90,  90,  95, 95,  90,  90,  90,    // Ch0-7
-    90, 90, 90,  90, 90,  90,  90, 100,    // Ch8-15
-  95, 90,  90,  100, 90 },                  // Ch16-20 (Ch20 = main)
+    90, 90, 90,  90, 95,  90,  90, 105,    // Ch8-15
+  95, 90,  90,  100, 100 },                  // Ch16-20 (Ch20 = main)
   // ── unit 3 · Lander B ──  bench-confirmed 2026-08-18
+  {  95, 90, 90, 95, 90, 90,  95, 90,    // Ch0-7
+   95,  95, 95,  90,  95, 95,  95, 95,     // Ch8-15
+   95, 95, 95, 95,  90 },                   // Ch16-20 (Ch20 = main)
+  // ── unit 4 · Lander C ──  bench-confirmed 2026-08-18
   {  85, 80, 85, 85, 85, 85,  85, 85,    // Ch0-7
-   85,  85, 85,  85,  85, 85,  85, 85,     // Ch8-15
-   85, 85, 85, 85,  90 },                   // Ch16-20 (Ch20 = main)
-  // ── unit 4 · Lander C ──  bench-confirmed 2026-08-18 — Ch18-19 PLACEHOLDER
-  //    Servos on Ch18-19 are burnt out / missing on this physical unit. The
-  //    two values below (95, 90 — copied from Lander D) are NOT real bench
-  //    angles; they only exist so degToPulse()/buildPulseTables() never
-  //    operate on an uninitialized/garbage value. Per the team's call, the
-  //    firmware was NOT changed to skip these channels for C — those
-  //    physical ports must not be wired to real sample valves on this unit,
-  //    and C's mission will spend 2 of its 20 sample wake cycles opening/
-  //    closing dead or unconnected ports (harmless, just wasted cycles).
-  //    Ch0-17 and Ch20 (main) below ARE real bench-confirmed angles.
-  {  95, 100, 105, 95,  100, 100,  100, 100,    // Ch0-7 (real)
-    110,  100, 115, 105, 105, 105, 100, 100,     // Ch8-15 (real)
-   95, 105,  105,  100, 90 },                  // Ch16-17 real, Ch18-19 PLACEHOLDER, Ch20 real (main)
+   85,  85, 80,  85,  85, 85,  90, 85,     // Ch8-15
+   90, 90, 90, 85,  90 },                   // Ch16-20 (Ch20 = main)
 };
 
 //  Flip a row's flag to true ONLY after that physical unit's angles are
-//  bench-confirmed and pasted above. Placeholder rows stay false → the assembly
-//  build refuses to arm them. All four rows are now bench-confirmed and
-//  committed. (Lander C's Ch18-19 are placeholders, not real angles — see the
+//  bench-confirmed and pasted above. An uncommitted row stays false and the
+//  FLIGHT build refuses to arm that unit (calCommitted() -> g_idOk). The flag
+//  gates ARMING ONLY: the angles are still loaded into CH_OPEN and are fully
+//  usable, so an uncommitted unit behaves normally on the calibrate build --
+//  setid, table, rest, jogging and hold-checks all work.
+//
+//  unit 3 - Lander B: UNCOMMITTED 2026-08-25. Its open angles were lowered
+//  after a fuse was burnt closing too far, and an inner tube was fitted to ease
+//  closing and stop the tubes being cut. Those new angles are NOT yet
+//  bench-verified. Flip back to true once the water check confirms them.
+//
+//  (Lander C's Ch18-19 are placeholders, not real angles — see the
 //  note on that row above; this does NOT block arming C, since the rest of
 //  its board is real and those 2 dead ports are a known, accepted gap.)
-constexpr bool CAL_COMMITTED[LANDER_COUNT] = { true, true, true, true };
+constexpr bool CAL_COMMITTED[LANDER_COUNT] = { true, true, false, true };
+//                                              D     A     B     C
+//                                                          ^ pending water check
 
 //  Bounds-checked row accessor. id is 1..LANDER_COUNT; returns nullptr when the
 //  ID is unset (0) or out of range, so callers can fail safe.
@@ -272,8 +280,9 @@ constexpr bool _calAllRowsOk(uint8_t r = 0) {
 }
 // The main valve's full offset must fit under the ceiling on EVERY unit. If it
 // clamps, that unit silently gets less travel than the others — which is
-// exactly the inconsistency the offset was adopted to remove. Fleet ceiling is
-// set by the highest Ch20 open angle (Lander A at 105°).
+// exactly the inconsistency the offset was adopted to remove. The binding case
+// is whichever unit has the highest Ch20 open angle; all four currently open at
+// 90°, so the fleet clears MAIN_CLOSE_MAX_DEG by 30°.
 constexpr bool _calMainCloseFits(uint8_t r = 0) {
   return (r >= LANDER_COUNT)
            ? true

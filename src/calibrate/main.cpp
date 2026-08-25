@@ -100,10 +100,12 @@ void moveChannel(uint8_t ch, uint8_t deg) {
     Serial.println("). Release one first:  r <ch>");
     return;
   }
-  if (!railIsOn()) {
-    Serial.println("[WARN] cold rail-up: uncommanded servos will centre (~90 deg = OPEN).");
-    Serial.println("       Run `railup` first if you want all 21 held at resting.");
-  }
+  // Cold rail: preload ALL 21 to resting before energising, or every
+  // uncommanded servo centres (~90 deg = OPEN). No-op once the rail is up, so
+  // this costs one preload per bench session. Matches the deploy build's
+  // driveServo(). Without it, `rest` — the last step of bench setup — began by
+  // throwing the whole fleet open.
+  railUpAllCommanded();
   uint16_t pulse = degToPulse(deg);
   applyPWM(ch, pulse);                              // signal first...
   servoMarkActive(ch, true);
@@ -180,6 +182,8 @@ void printHelp() {
   Serial.println("  table        print this unit's open/close map");
   Serial.println("  setid <n>    stamp this board's lander ID 1-4 into NVS");
   Serial.println("  id           show the stamped lander ID");
+  Serial.println("  clearmission wipe mission state (keeps unit ID) — run before");
+  Serial.println("               flashing a flight build onto a rehearsed board");
   Serial.println("  rest         RESTING STATE: Ch0-19 closed, Ch20 open");
   Serial.println("               (last step of bench setup, before flashing the mission)");
   Serial.println("  help         this list");
@@ -240,8 +244,8 @@ void loop() {
 
   if (input == "rail") {
     Serial.println("[WARN] zero-PWM rail-up: uncommanded servos will centre (~90 deg = OPEN).");
-    Serial.println("       This is the Q2 gate-table test. For normal work use a move command,");
-    Serial.println("       which preloads all channels first.");
+    Serial.println("       This is the Q2 gate-table test ONLY. For normal work use a move");
+    Serial.println("       command or `railup` — both preload all 21 channels first.");
     railOn();
     Serial.println("Rail ON, no PWM (GPIO25 HIGH row)");
     return;
@@ -328,6 +332,22 @@ void loop() {
                     i, o, degToPulse(o), c, degToPulse(c),
                     i == MAIN_SERVO_CH ? "   (MAIN)" : "");
     }
+    return;
+  }
+
+  // Clear mission state so a flight build cannot inherit a rehearsal's.
+  // Mission state lives in a per-build namespace (karen_d / karen_m); builds
+  // before 2026-08-25 kept it in "karen" beside the unit ID, so clear those
+  // keys individually too. The unit ID itself is never touched.
+  if (input == "clearmission") {
+    prefs.begin("karen_d", false); prefs.clear(); prefs.end();
+    prefs.begin("karen_m", false); prefs.clear(); prefs.end();
+    prefs.begin("karen", false);
+    prefs.remove("armed"); prefs.remove("done");
+    prefs.remove("evt");   prefs.remove("elapsed");
+    prefs.end();
+    Serial.println("Mission state cleared — flight, rehearsal and legacy. Unit ID kept.");
+    Serial.println("A flight build will now self-arm at t=0 on its next power-on.");
     return;
   }
 

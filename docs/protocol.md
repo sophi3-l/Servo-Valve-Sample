@@ -15,18 +15,38 @@ readings of the workbook that were rejected. If the protocol changes, change
 the ARM one-shot pulses U10 ON, and the ESP32 boots. There is no operator arm
 step in the flight path.
 
-This matches both the workbook's own column header ("Seconds since powered on")
-and the Rev K deployment procedure (install plug → confirm → it runs).
+> **Corrected 2026-08-25.** This section previously claimed Sheet 1's own origin
+> *was* power-on, so `SAMPLE_TIME_S` held raw Sheet 1 times and every event fired
+> **5 minutes early**. Sheet 1's clock starts at the *end* of the 5 min deck
+> window. The firmware's clock starts at power-on and keeps running through that
+> window, so the table now stores **Sheet 1 + 300 s**. First sample: 33h00m00s.
+> See `claude/review-2026-08-25-schedule-5min-offset.md`.
 
 ## Which sheet is authoritative
 
 The workbook has two sheets whose clocks differ by **exactly 3300 s** on every
-row — that is 1 h − 5 min, matching the helper cells at E25/E26.
+row — that is 1 h − 5 min, matching the helper cells at E25/E26. Those are two
+separate things added together, which is what made this easy to misread:
 
-- **Sheet 1, "Sampling Protocol"** — origin is power-on. **This is the authority
-  for this controller.** The 5 min is the deck WiFi/service window.
-- **Sheet 2, "Lander+Samples"** — the whole-lander view on a different origin.
-  Every sample row equals Sheet 1 minus 3300 s.
+- **1 h** — the real offset between a lander event and its sample.
+- **− 5 min** — a difference in *clock origin*, not in event timing. It is the
+  deck WiFi/service window (`AP_BOOT_WINDOW_MS`).
+
+So:
+
+- **Sheet 1, "Sampling Protocol"** — the authority for sample times. Its origin
+  is power-on **+ 5 min**. Add 300 s to put a Sheet 1 row on the firmware clock.
+- **Sheet 2, "Lander+Samples"** — the whole-lander view. Every sample row equals
+  Sheet 1 minus 3300 s.
+
+On the power-on clock the firmware uses, each sample lands exactly **1 h** after
+its lander event, and each Tfinal exactly **288 s** before the lander's next
+"turn to ambient" — the ordering requirement under "Timer accuracy" below.
+
+**The lander's own program must share this convention.** Both were built from the
+same workbook, so its six "turn to ambient" events should fall on exact hours
+after power-on: 93h, 161h, 229h, 297h, 365h, 433h. If they are at 92h55m and so
+on instead, the two devices are 5 min apart and the 288 s margin inverts.
 
 Sheet 2 also lists twelve `valve opens to ambient` / `valve closes to inc N`
 events. **Those are not ours** — they belong to the lander's own programming, per
@@ -47,8 +67,8 @@ Two other readings were considered and rejected:
 - *"All 32 events are ours, routine taken literally."* This is what a naive
   implementation produces, and it silently ruins the science: common would sit
   open to ambient for the whole of incubations 3–6. For example, opening common
-  at the end of T0 inc3 (t = 608,224 s) with no scheduled close until
-  t = 824,100 s leaves it open for 60 hours.
+  at the end of T0 inc3 (t = 608,524 s) with no scheduled close until
+  t = 824,400 s leaves it open for 60 hours.
 
 ## Per-event routine
 
@@ -126,38 +146,38 @@ Event *i* drives `SERVO_CHANNELS[i]`.
 
 | # | Ch | t (s) | t | gap | Label |
 |---|---|---|---|---|---|
-| 1 | 0 | 118,500 | 32h55m | 32h55m | T0 inc1 |
-| 2 | 1 | 334,212 | 92h50m | 59h55m | Tfinal inc1 |
-| 3 | 2 | 363,300 | 100h55m | 8h04m | T0 inc2 |
-| 4 | 3 | 579,012 | 160h50m | 59h55m | Tfinal inc2 |
-| 5 | 4 | 608,100 | 168h55m | 8h04m | T0 inc3 |
-| 6 | 5 | 680,100 | 188h55m | 20h00m | T1 inc3 |
-| 7 | 6 | 752,100 | 208h55m | 20h00m | T2 inc3 |
-| 8 | 7 | 823,812 | 228h50m | 19h55m | Tfinal inc3 |
-| 9 | 8 | 852,900 | 236h55m | 8h04m | T0 inc4 |
-| 10 | 9 | 924,900 | 256h55m | 20h00m | T1 inc4 |
-| 11 | 10 | 996,900 | 276h55m | 20h00m | T2 inc4 |
-| 12 | 11 | 1,068,612 | 296h50m | 19h55m | Tfinal inc4 |
-| 13 | 12 | 1,097,700 | 304h55m | 8h04m | T0 inc5 |
-| 14 | 13 | 1,169,700 | 324h55m | 20h00m | T1 inc5 |
-| 15 | 14 | 1,241,700 | 344h55m | 20h00m | T2 inc5 |
-| 16 | 15 | 1,313,412 | 364h50m | 19h55m | Tfinal inc5 |
-| 17 | 16 | 1,342,500 | 372h55m | 8h04m | T0 inc6 |
-| 18 | 17 | 1,414,500 | 392h55m | 20h00m | T1 inc6 |
-| 19 | 18 | 1,486,500 | 412h55m | 20h00m | T2 inc6 |
-| 20 | 19 | 1,558,212 | 432h50m | 19h55m | Tfinal inc6 |
+| 1 | 0 | 118,800 | 33h00m00s | 33h00m00s | T0 inc1 |
+| 2 | 1 | 334,512 | 92h55m12s | 59h55m12s | Tfinal inc1 |
+| 3 | 2 | 363,600 | 101h00m00s | 8h04m48s | T0 inc2 |
+| 4 | 3 | 579,312 | 160h55m12s | 59h55m12s | Tfinal inc2 |
+| 5 | 4 | 608,400 | 169h00m00s | 8h04m48s | T0 inc3 |
+| 6 | 5 | 680,400 | 189h00m00s | 20h00m00s | T1 inc3 |
+| 7 | 6 | 752,400 | 209h00m00s | 20h00m00s | T2 inc3 |
+| 8 | 7 | 824,112 | 228h55m12s | 19h55m12s | Tfinal inc3 |
+| 9 | 8 | 853,200 | 237h00m00s | 8h04m48s | T0 inc4 |
+| 10 | 9 | 925,200 | 257h00m00s | 20h00m00s | T1 inc4 |
+| 11 | 10 | 997,200 | 277h00m00s | 20h00m00s | T2 inc4 |
+| 12 | 11 | 1,068,912 | 296h55m12s | 19h55m12s | Tfinal inc4 |
+| 13 | 12 | 1,098,000 | 305h00m00s | 8h04m48s | T0 inc5 |
+| 14 | 13 | 1,170,000 | 325h00m00s | 20h00m00s | T1 inc5 |
+| 15 | 14 | 1,242,000 | 345h00m00s | 20h00m00s | T2 inc5 |
+| 16 | 15 | 1,313,712 | 364h55m12s | 19h55m12s | Tfinal inc5 |
+| 17 | 16 | 1,342,800 | 373h00m00s | 8h04m48s | T0 inc6 |
+| 18 | 17 | 1,414,800 | 393h00m00s | 20h00m00s | T1 inc6 |
+| 19 | 18 | 1,486,800 | 413h00m00s | 20h00m00s | T2 inc6 |
+| 20 | 19 | 1,558,512 | 432h55m12s | 19h55m12s | Tfinal inc6 |
 
 Six incubations of 2/2/4/4/4/4 samples = 20, exactly the number of sample valves.
-Mission ends 126 s after the last event: **1,558,338 s = 432.87 h = 18.04 days**,
+Mission ends 125 s after the last event: **1,558,637 s = 432.95 h = 18.04 days**,
 inside the Rev K 21-day planning basis.
 
-Smallest gap is 8 h 04 m against a 126 s routine — a 230× margin, so events can
-never collide.
+Smallest gap is 8 h 04 m 48 s against a 125 s routine — a 230× margin, so events
+can never collide.
 
 ## Scheduling
 
 The scheduler walks the table by index and sleeps
-`next_event_time − elapsed_now`. Because the target is absolute, the 126 s
+`next_event_time − elapsed_now`. Because the target is absolute, the 125 s
 routine and any service window come out of the *following* sleep rather than
 pushing every later event back. Simulated across the full mission this gives
 **zero overshoot**; a fixed-delta scheduler would have accumulated well over an
@@ -172,19 +192,19 @@ the `[CLOCK]` log line is the only record. Read the logs at recovery.
 
 ### MINI_DEPLOY compression
 
-Rehearsals compress the **waits only**; the 126 s routine runs at full flight
+Rehearsals compress the **waits only**; the 125 s routine runs at full flight
 timing, because the servo behaviour is the untested part (8 °C, in oil, on a 6 V
 pack). Gaps are scaled proportionally (`MINI_DIV = 2000`, floor 10 s) rather than
 flattened, so a rehearsal still walks the real irregular table.
 
-Consequence: a rehearsal cannot be shorter than 20 × 126 s = 42 min, and lands at
+Consequence: a rehearsal cannot be shorter than 20 × 125 s = 42 min, and lands at
 **~55 min**. This is deliberate.
 
 ## Timer accuracy
 
 The Tfinal times are specified to 0.08 h (~5 min). That figure is not a precision
 requirement — each Tfinal sits exactly 288 s before the lander's following
-"turn to ambient" event, and the routine takes 126 s, so the `.92` spacing exists
+"turn to ambient" event, and the routine takes 125 s, so the `.92` spacing exists
 to fit the last sample of an incubation in before the switch. It is an **ordering**
 requirement, and ordering survives clock drift because every event comes off the
 same clock.

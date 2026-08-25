@@ -7,13 +7,27 @@
 //  calibration.h owns electrical truth; this owns WHEN. Keep them separate.
 //
 //  t = 0 is POWER-ON (deployment plug latches U10, ESP32 boots). No operator
-//  arm step. Matches the protocol sheet's "seconds since powered on".
+//  arm step.
 //
-//  SHEET 1 "Sampling Protocol" is the authority. Sheet 2 "Lander+Samples" is
-//  the whole-lander view on a clock 3300 s (1 h - 5 min) earlier; its 12
-//  "valve opens to ambient / closes to inc N" rows belong to the LANDER, not
-//  this controller (see its "Lander Programming (Ignore)" note). Common rests
-//  OPEN and closes only inside a sample event. Do not add those 12 events.
+//  *** THE 5 MIN DECK WINDOW IS ALREADY IN THESE NUMBERS. DO NOT SUBTRACT IT. ***
+//  Sheet 1's clock starts 5 min AFTER power-on - that 5 min is the deck
+//  service window (AP_BOOT_WINDOW_MS). This firmware's clock starts AT
+//  power-on and keeps running THROUGH that window (runServiceWindow() never
+//  touches the elapsed accumulator), so every entry below is a Sheet 1 time
+//  + 300 s. First sample: 33h00m00s after power-on.
+//  Corrected 2026-08-25: the table previously held raw Sheet 1 times, so every
+//  event fired 5 min early. See claude/review-2026-08-25-schedule-5min-offset.md.
+//
+//  SHEET 1 "Sampling Protocol" is the authority for sample times. Sheet 2
+//  "Lander+Samples" is the whole-lander view, and a Sheet 2 row = Sheet 1
+//  - 3300 s. That 3300 is two things at once: 1 h of real offset between a
+//  lander event and its sample, minus the 5 min of clock-origin difference.
+//  On the power-on clock used below, each sample therefore sits exactly 1 h
+//  after its lander event, and each Tfin exactly 288 s before the lander's
+//  next "turn to ambient". Sheet 2's 12 "valve opens to ambient / closes to
+//  inc N" rows belong to the LANDER, not this controller (see its "Lander
+//  Programming (Ignore)" note) - do not add them. Common rests OPEN and
+//  closes only inside a sample event.
 //
 //  PER-EVENT ROUTINE. The protocol fixes WHEN commands are issued, not how long
 //  the servo stays powered. Keeping them separate means the release time can be
@@ -66,34 +80,34 @@ constexpr uint32_t SAMPLE_DWELL_MS = SAMPLE_OPEN_MS - STEP_SETTLE_MS;
 //  them, so the sample index IS the event index. No action column is needed —
 //  every event in this mission is a sample.
 //
-//  #   Ch   t (s)        t          gap        protocol label
+//        t (s)      #   Ch          t           gap       label  increment
 constexpr uint8_t  EVENT_COUNT = SAMPLE_SERVO_COUNT;      // 20
 constexpr uint32_t SAMPLE_TIME_S[EVENT_COUNT] = {
-    118500UL,   //  1  Ch0    32h55m   32h55m   T0    inc1
-    334212UL,   //  2  Ch1    92h50m   59h55m   Tfin  inc1
-    363300UL,   //  3  Ch2   100h55m    8h04m   T0    inc2
-    579012UL,   //  4  Ch3   160h50m   59h55m   Tfin  inc2
-    608100UL,   //  5  Ch4   168h55m    8h04m   T0    inc3
-    680100UL,   //  6  Ch5   188h55m   20h00m   T1    inc3
-    752100UL,   //  7  Ch6   208h55m   20h00m   T2    inc3
-    823812UL,   //  8  Ch7   228h50m   19h55m   Tfin  inc3
-    852900UL,   //  9  Ch8   236h55m    8h04m   T0    inc4
-    924900UL,   // 10  Ch9   256h55m   20h00m   T1    inc4
-    996900UL,   // 11  Ch10  276h55m   20h00m   T2    inc4
-   1068612UL,   // 12  Ch11  296h50m   19h55m   Tfin  inc4
-   1097700UL,   // 13  Ch12  304h55m    8h04m   T0    inc5
-   1169700UL,   // 14  Ch13  324h55m   20h00m   T1    inc5
-   1241700UL,   // 15  Ch14  344h55m   20h00m   T2    inc5
-   1313412UL,   // 16  Ch15  364h50m   19h55m   Tfin  inc5
-   1342500UL,   // 17  Ch16  372h55m    8h04m   T0    inc6
-   1414500UL,   // 18  Ch17  392h55m   20h00m   T1    inc6
-   1486500UL,   // 19  Ch18  412h55m   20h00m   T2    inc6
-   1558212UL,   // 20  Ch19  432h50m   19h55m   Tfin  inc6
+     118800UL,   //  1  Ch0      33h00m00s   33h00m00s  T0    inc1
+     334512UL,   //  2  Ch1      92h55m12s   59h55m12s  Tfin  inc1
+     363600UL,   //  3  Ch2     101h00m00s    8h04m48s  T0    inc2
+     579312UL,   //  4  Ch3     160h55m12s   59h55m12s  Tfin  inc2
+     608400UL,   //  5  Ch4     169h00m00s    8h04m48s  T0    inc3
+     680400UL,   //  6  Ch5     189h00m00s   20h00m00s  T1    inc3
+     752400UL,   //  7  Ch6     209h00m00s   20h00m00s  T2    inc3
+     824112UL,   //  8  Ch7     228h55m12s   19h55m12s  Tfin  inc3
+     853200UL,   //  9  Ch8     237h00m00s    8h04m48s  T0    inc4
+     925200UL,   // 10  Ch9     257h00m00s   20h00m00s  T1    inc4
+     997200UL,   // 11  Ch10    277h00m00s   20h00m00s  T2    inc4
+    1068912UL,   // 12  Ch11    296h55m12s   19h55m12s  Tfin  inc4
+    1098000UL,   // 13  Ch12    305h00m00s    8h04m48s  T0    inc5
+    1170000UL,   // 14  Ch13    325h00m00s   20h00m00s  T1    inc5
+    1242000UL,   // 15  Ch14    345h00m00s   20h00m00s  T2    inc5
+    1313712UL,   // 16  Ch15    364h55m12s   19h55m12s  Tfin  inc5
+    1342800UL,   // 17  Ch16    373h00m00s    8h04m48s  T0    inc6
+    1414800UL,   // 18  Ch17    393h00m00s   20h00m00s  T1    inc6
+    1486800UL,   // 19  Ch18    413h00m00s   20h00m00s  T2    inc6
+    1558512UL,   // 20  Ch19    432h55m12s   19h55m12s  Tfin  inc6
 };
-//  Mission ends 126 s after the last event: 1,558,338 s = 432.87 h = 18.04 d.
+//  Mission ends 125 s after the last event: 1,558,637 s = 432.95 h = 18.04 d.
 
 // ---- Heartbeat -------------------------------------------------------------
-//  Gaps run to 59h55m and nothing happens for the first 32h55m. These wakes log
+//  Gaps run to 59h55m12s and nothing happens for the first 33h00m. These wakes log
 //  battery + elapsed and sleep again, no actuation: ~1.2 mAh across the mission
 //  against a ~8,700 mAh sleep budget.
 #ifdef MINI_DEPLOY
@@ -140,7 +154,7 @@ constexpr bool _schedIncreasing(uint8_t i = 1) {
            : ((SAMPLE_TIME_S[i] > SAMPLE_TIME_S[i - 1]) && _schedIncreasing(i + 1));
 }
 // No event may start before the previous event's routine has finished. The
-// real minimum gap is 8h04m against a 126 s routine, so this has enormous
+// real minimum gap is 8h04m48s against a 125 s routine, so this has enormous
 // margin — it exists to catch a mistyped timestamp, not a design error.
 constexpr bool _schedNoOverlap(uint8_t i = 1) {
   return (i >= EVENT_COUNT)
@@ -151,7 +165,7 @@ constexpr bool _schedNoOverlap(uint8_t i = 1) {
 static_assert(_schedIncreasing(),
               "schedule.h: SAMPLE_TIME_S must be strictly increasing.");
 static_assert(_schedNoOverlap(),
-              "schedule.h: two events are closer together than the 126 s sample routine.");
+              "schedule.h: two events are closer together than the 125 s sample routine.");
 static_assert(EVENT_COUNT == SAMPLE_SERVO_COUNT,
               "schedule.h: one event per sample valve — event index IS the sample index.");
 static_assert(SAMPLE_OPEN_MS > STEP_SETTLE_MS,
