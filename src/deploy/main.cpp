@@ -101,7 +101,8 @@ constexpr uint32_t PRELOAD_S  = (PRELOAD_MS + 999) / 1000;
 
 // ── Per-unit identity ────────────────────────────────────────────────────────
 uint8_t         g_unitId = 0;
-bool            g_idOk   = false;
+bool            g_idOk   = false;   // valid row AND calibration committed -> may arm
+bool            g_haveRow = false;  // valid row for this board (may be uncommitted)
 const uint8_t*  CH_OPEN  = nullptr;   // this unit's open angles, indexed by CHANNEL
 const uint8_t*  SAMPLE_ORDER = nullptr;   // this unit's mission order, indexed by EVENT
 
@@ -273,6 +274,19 @@ uint16_t restingPulse(uint8_t ch) {
 // preventing it requires all of them commanded at that moment.
 void railUpAllCommanded() {
   if (railIsOn()) return;
+  // No valid row for this board => CH_OPEN is the unit-1 fallback, i.e. another
+  // lander's angles. Preloading those risks driving a valve into its stop, and
+  // a stalled servo is the whole burnout exposure. Same refusal the calibrate
+  // build makes ("driving with another unit's angles risks over-travelling a
+  // valve"); accept the uncommanded centring instead and say so loudly.
+  // NOTE: keyed on g_haveRow, not g_idOk — a real-but-uncommitted row (a unit
+  // awaiting bench confirmation) still holds ITS OWN correct angles.
+  if (!g_haveRow) {
+    Serial.println("[RAILUP] REFUSED to preload — no unit ID; uncommanded servos "
+                   "will centre (~90 deg = OPEN). Stamp the board with `setid`.");
+    railOn();
+    return;
+  }
   for (uint8_t ch = 0; ch <= MAIN_SERVO_CH; ch++) {
     setPWM(ch, restingPulse(ch));
     servoPositions[ch] = (ch == MAIN_SERVO_CH) ? POS_OPEN : POS_CLOSE;
@@ -370,7 +384,8 @@ void loadUnitId() {
   g_unitId = prefs.getUChar("unitid", 0);
   prefs.end();
   const uint8_t* row = chOpenRow(g_unitId);
-  g_idOk  = (row != nullptr) && calCommitted(g_unitId);
+  g_haveRow = (row != nullptr);
+  g_idOk    = g_haveRow && calCommitted(g_unitId);
   CH_OPEN = row ? row : CH_OPEN_DEG_ALL[0];   // row-0 fallback keeps math safe
   const uint8_t* ord = sampleOrderRow(g_unitId);
   SAMPLE_ORDER = ord ? ord : SAMPLE_ORDER_ALL[0];   // same fail-safe fallback
@@ -786,18 +801,27 @@ void runMissionWake(bool freshBoot, bool unexpectedReset) {
                 (unsigned long)missionElapsedS(), st.evtIdx + 1, EVENT_COUNT, vb,
                 unexpectedReset ? "  (UNEXPECTED RESET — resuming)" : "");
 
+  // Decide LOW *before* opening any service window. A window costs ~120 mA for
+  // 5 min (~10 mAh) — more than the valve movement it is gating — and on the
+  // unexpected-reset path there is nobody on deck to use it. The header's "low
+  // battery logs and skips, it does not actuate" was previously undercut here.
+  bool low = batteryTooLow(vb);
+  if (low) Serial.printf("[WAKE]  LOW BATTERY %.2f V < %.2f V — no actuation this wake\n", vb, VBATT_CUTOFF_V);
+
   if (freshBoot) {
     // Confirm the latch caught, and let an operator intervene. NOTHING MOVES
     // HERE — the resting state is a precondition established on the bench via
     // the calibrate build's `rest`, not something this build asserts on every
     // power-up. See the RESTING STATE note in the header block.
+    // Kept even on a low battery: this is the deck check and the operator's
+    // only abort opportunity, and a low reading is exactly what they need to
+    // see. The pack is also at its healthiest here, not 400 h into a mission.
     if (runServiceWindow(AP_BOOT_WINDOW_MS, LED_CONFIRM_MS) && !st.armed) { g_benchMode = true; return; }
-  } else if (unexpectedReset) {
+  } else if (unexpectedReset && !low) {
     if (runServiceWindow(AP_BOOT_WINDOW_MS, 0) && !st.armed) { g_benchMode = true; return; }
+  } else if (unexpectedReset) {
+    Serial.println("[WAKE]  post-reset service window SKIPPED — low battery outranks access");
   }
-
-  bool low = batteryTooLow(vb);
-  if (low) Serial.printf("[WAKE]  LOW BATTERY %.2f V < %.2f V — no actuation this wake\n", vb, VBATT_CUTOFF_V);
 
   // Rail up with all channels commanded, then wait for the event's exact t=0.
   // Doing this before the routine (rather than inside its first drive) is what

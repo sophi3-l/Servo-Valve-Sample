@@ -24,34 +24,54 @@ step in the flight path.
 
 ## Which sheet is authoritative
 
-The workbook has two sheets whose clocks differ by **exactly 3300 s** on every
-row — that is 1 h − 5 min, matching the helper cells at E25/E26. Those are two
-separate things added together, which is what made this easy to misread:
+**Verified directly against `SamplingProtocol.xlsx` on 2026-08-25.**
 
-- **1 h** — the real offset between a lander event and its sample.
-- **− 5 min** — a difference in *clock origin*, not in event timing. It is the
-  deck WiFi/service window (`AP_BOOT_WINDOW_MS`).
+**Sheet 1, "Sampling Protocol"** is the authority for this controller, and
+`SAMPLE_TIME_S` is now an exact copy of its column A — all 20 rows checked value
+by value. Its cells are formulas of the form:
 
-So:
+```
+A2 = (32*60*60) + $E$25 - $E$26      ->  118800
+```
 
-- **Sheet 1, "Sampling Protocol"** — the authority for sample times. Its origin
-  is power-on **+ 5 min**. Add 300 s to put a Sheet 1 row on the firmware clock.
-- **Sheet 2, "Lander+Samples"** — the whole-lander view. Every sample row equals
-  Sheet 1 minus 3300 s.
+with helper cells `E25 "add hour" = 3600` and `E26 "subtract 5 min" = 0`.
+**E26 has been zeroed in the workbook and flagged `<- updated`.** The firmware
+had been transcribed from the earlier version where it was 300, which is exactly
+why every event fired 5 minutes early until 2026-08-25.
 
-On the power-on clock the firmware uses, each sample lands exactly **1 h** after
-its lander event, and each Tfinal exactly **288 s** before the lander's next
-"turn to ambient" — the ordering requirement under "Timer accuracy" below.
+**Sheet 2, "Lander+Samples"** is the whole-lander view. Its column A is *also*
+labelled "time since power on", and it carries the same sample events **one hour
+earlier** than Sheet 1 — Sheet 1 = Sheet 2 + `E25` on every row. It also lists
+the lander's own `valve opens to ambient` / `valve closes to inc N` rows, marked
+"Lander Programming (Ignor)", which are deliberately absent from `SAMPLE_TIME_S`.
 
-**The lander's own program must share this convention.** Both were built from the
-same workbook, so its six "turn to ambient" events should fall on exact hours
-after power-on: 93h, 161h, 229h, 297h, 365h, 433h. If they are at 92h55m and so
-on instead, the two devices are 5 min apart and the 288 s margin inverts.
-
-Sheet 2 also lists twelve `valve opens to ambient` / `valve closes to inc N`
-events. **Those are not ours** — they belong to the lander's own programming, per
-the "Lander Programming (Ignore)" annotation on that sheet. They are deliberately
-absent from `SAMPLE_TIME_S`.
+> ### OPEN — the "add hour" is applied to the samples only
+>
+> On Sheet 2 each Tfinal sits **288 s before** the lander's next "valve turns to
+> ambient" (91.92 h vs 92 h, 159.92 vs 160, and so on). That is the ordering
+> requirement described under "Timer accuracy" below — the last sample of an
+> incubation must land before the lander switches.
+>
+> Sheet 1 adds `E25` = 3600 s to every **sample** row. The **lander** rows on
+> Sheet 2 do not carry it. So if the lander is programmed to Sheet 2's literal
+> hours, every Tfinal now fires **3312 s (55 min) after** the switch it is meant
+> to precede, on all six increments:
+>
+> | | lander turns to ambient | our Tfinal | |
+> |---|---|---|---|
+> | inc1 | 331,200 s (92 h) | 334,512 s | +3312 s |
+> | inc2 | 576,000 s (160 h) | 579,312 s | +3312 s |
+> | inc3 | 820,800 s (228 h) | 824,112 s | +3312 s |
+> | inc4 | 1,065,600 s (296 h) | 1,068,912 s | +3312 s |
+> | inc5 | 1,310,400 s (364 h) | 1,313,712 s | +3312 s |
+>
+> Either the lander's program carries the same +1 h — ordering preserved,
+> nothing to do — or it does not, and the sample schedule is an hour late
+> against the lander. **Settle with Zach before flight.** The question is one
+> line: *does the lander turn its valve to ambient at 92 h or at 93 h after
+> power-on?*
+>
+> This is independent of the 5-minute fix, which is confirmed correct.
 
 ## The common valve rests OPEN
 
